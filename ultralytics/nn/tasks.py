@@ -36,6 +36,7 @@ from ultralytics.nn.modules import (
     C2fPSA,
     C3Ghost,
     C3k2,
+    C3k2_UniRep_CR,
     C3x,
     CBFuse,
     CBLinear,
@@ -67,6 +68,7 @@ from ultralytics.nn.modules import (
     Segment,
     Segment26,
     TorchVision,
+    UniRepBottleneck_CR,
     WorldDetect,
     YOLOEDetect,
     YOLOESegment,
@@ -1591,6 +1593,7 @@ def parse_model(d, ch, verbose=True):
             C2,
             C2f,
             C3k2,
+            C3k2_UniRep_CR,
             RepNCSPELAN4,
             ELAN1,
             ADown,
@@ -1608,6 +1611,7 @@ def parse_model(d, ch, verbose=True):
             SCDown,
             C2fCIB,
             A2C2f,
+            UniRepBottleneck_CR,
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1617,6 +1621,7 @@ def parse_model(d, ch, verbose=True):
             C2,
             C2f,
             C3k2,
+            C3k2_UniRep_CR,
             C2fAttn,
             C3,
             C3TR,

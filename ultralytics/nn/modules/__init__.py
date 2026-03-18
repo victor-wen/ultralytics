@@ -105,6 +105,14 @@ from .transformer import (
     TransformerEncoderLayer,
     TransformerLayer,
 )
+from .unirep_cr import (
+    C3k2_UniRep_CR,
+    ContextResidualLargeKernelBlock,
+    DilatedReparamBlock,
+    UniRepBottleneck_CR,
+    build_pose_supervision_mask,
+    reparameterize_unirep_model,
+)
 
 __all__ = (
     "AIFI",
@@ -137,6 +145,7 @@ __all__ = (
     "C2fPSA",
     "C3Ghost",
     "C3k2",
+    "C3k2_UniRep_CR",
     "C3x",
     "CBFuse",
     "CBLinear",
@@ -149,6 +158,7 @@ __all__ = (
     "ConvTranspose",
     "DWConv",
     "DWConvTranspose2d",
+    "DilatedReparamBlock",
     "DeformableTransformerDecoder",
     "DeformableTransformerDecoderLayer",
     "Detect",
@@ -165,6 +175,7 @@ __all__ = (
     "MLPBlock",
     "MSDeformAttn",
     "MaxSigmoidAttnBlock",
+    "ContextResidualLargeKernelBlock",
     "Pose",
     "Pose26",
     "Proto",
@@ -182,9 +193,12 @@ __all__ = (
     "TransformerBlock",
     "TransformerEncoderLayer",
     "TransformerLayer",
+    "UniRepBottleneck_CR",
     "WorldDetect",
     "YOLOEDetect",
     "YOLOESegment",
     "YOLOESegment26",
+    "build_pose_supervision_mask",
+    "reparameterize_unirep_model",
     "v10Detect",
 )

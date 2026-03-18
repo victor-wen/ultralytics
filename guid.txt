@@ -1,0 +1,1125 @@
+下面给你一套**能直接合进 Ultralytics 框架**的版本。
+这次只做你定下来的 **1 / 2 / 4**：
+
+* **1** 保住完整 local hidden path，大核只做 `context residual`
+* **2** `SE/ECA` 和 `SpatialGate` 只作用在 `g` 分支
+* **4** `pose` 从纯 `fg_mask` 部分解耦，增加 `center_3x3` 额外正样本
+
+我按“**新增文件 + 框架补丁**”的方式给，最稳。
+
+---
+
+# 1. 新增模块文件
+
+新建文件：
+
+`ultralytics/nn/modules/unirep_cr.py`
+
+```python
+from __future__ import annotations
+
+import functools
+import math
+import warnings
+from typing import Dict, List, Sequence, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from ultralytics.nn.modules.block import C2f
+from ultralytics.nn.modules.conv import Conv
+
+__all__ = (
+    "SEBlock",
+    "ECABlock",
+    "SpatialGate",
+    "DilatedReparamBlock",
+    "ContextResidualLargeKernelBlock",
+    "UniRepBottleneck_CR",
+    "C3k2_UniRep_CR",
+    "build_pose_supervision_mask",
+    "reparameterize_unirep_model",
+)
+
+
+# ============================================================
+# 配置表
+# ============================================================
+
+DILATE_SETTINGS: Dict[int, Tuple[List[int], List[int]]] = {
+    17: ([5, 9, 3, 3, 3], [1, 2, 4, 5, 7]),
+    15: ([5, 7, 3, 3, 3], [1, 2, 3, 5, 7]),
+    13: ([5, 7, 3, 3, 3], [1, 2, 3, 4, 5]),
+    11: ([5, 5, 3, 3, 3], [1, 2, 3, 4, 5]),
+    9:  ([5, 5, 3, 3],    [1, 2, 3, 4]),
+    7:  ([7, 5, 3],       [1, 1, 1]),
+    5:  ([3, 3],          [1, 2]),
+}
+
+FUSION_TOL: float = 1e-4
+
+
+# ============================================================
+# 第三方大核实现延迟导入
+# ============================================================
+
+@functools.lru_cache(maxsize=1)
+def _get_lk_impl():
+    try:
+        from depthwise_conv2d_implicit_gemm import DepthWiseConv2dImplicitGEMM as _Impl
+        return _Impl
+    except ImportError:
+        return None
+    except Exception as e:
+        warnings.warn(f"加载第三方大核实现时异常: {e}", UserWarning)
+        return None
+
+
+# ============================================================
+# 工具函数
+# ============================================================
+
+def _to_2tuple(x):
+    if isinstance(x, Sequence) and not isinstance(x, (str, bytes)):
+        return int(x[0]), int(x[1])
+    return int(x), int(x)
+
+
+def _validate_positive_odd(name: str, value: int) -> int:
+    value = int(value)
+    if value <= 0 or value % 2 == 0:
+        raise ValueError(f"{name} 必须为正奇数，当前为 {value}")
+    return value
+
+
+def get_conv2d(
+    in_channels,
+    out_channels,
+    kernel_size,
+    stride,
+    padding=None,
+    dilation=1,
+    groups=1,
+    bias=False,
+    attempt_use_lk_impl=True,
+):
+    kernel_size = _to_2tuple(kernel_size)
+    if padding is None:
+        padding = (kernel_size[0] // 2, kernel_size[1] // 2)
+    else:
+        padding = _to_2tuple(padding)
+
+    need_large = (
+        kernel_size[0] == kernel_size[1]
+        and kernel_size[0] > 5
+        and padding == (kernel_size[0] // 2, kernel_size[1] // 2)
+    )
+
+    if attempt_use_lk_impl and need_large:
+        LKImpl = _get_lk_impl()
+        if (
+            LKImpl is not None
+            and in_channels == out_channels == groups
+            and stride == 1
+            and dilation == 1
+        ):
+            try:
+                return LKImpl(in_channels, kernel_size[0], bias=bias)
+            except Exception:
+                pass
+
+    return nn.Conv2d(
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride,
+        padding,
+        dilation,
+        groups,
+        bias,
+    )
+
+
+def fuse_bn(conv: nn.Conv2d, bn: nn.BatchNorm2d):
+    conv_bias = torch.zeros_like(bn.running_mean) if conv.bias is None else conv.bias
+    std = (bn.running_var + bn.eps).sqrt()
+    fused_w = conv.weight * (bn.weight / std).reshape(-1, 1, 1, 1)
+    fused_b = bn.bias + (conv_bias - bn.running_mean) * bn.weight / std
+    return fused_w, fused_b
+
+
+def convert_dilated_to_nondilated(kernel, dilate_rate):
+    if dilate_rate == 1:
+        return kernel.clone()
+    identity = torch.ones(1, 1, 1, 1, device=kernel.device, dtype=kernel.dtype)
+    return F.conv_transpose2d(kernel, identity, stride=dilate_rate)
+
+
+def merge_dilated_into_large_kernel(large_kernel, dilated_kernel, dilated_r):
+    large_k = large_kernel.size(2)
+    equiv_ks = dilated_r * (dilated_kernel.size(2) - 1) + 1
+    equiv_kernel = convert_dilated_to_nondilated(dilated_kernel, dilated_r)
+    pad = large_k // 2 - equiv_ks // 2
+    if pad < 0:
+        raise ValueError(f"等价核 {equiv_ks} > 大核 {large_k}")
+    return large_kernel + F.pad(equiv_kernel, [pad] * 4)
+
+
+def _apply_cdc_theta(weight, theta):
+    w = weight.clone()
+    center = w.size(2) // 2
+    w_sum = weight.sum(dim=[1, 2, 3])
+    w[:, 0, center, center] -= theta * w_sum
+    return w
+
+
+# ============================================================
+# 注意力模块：SE / ECA
+# ============================================================
+
+class SEBlock(nn.Module):
+    def __init__(self, channels: int, reduction: int = 4):
+        super().__init__()
+        mid = max(1, channels // reduction)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, mid, 1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid, channels, 1, bias=True),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        return x * self.fc(self.avg_pool(x))
+
+
+class ECABlock(nn.Module):
+    def __init__(self, channels: int, gamma: int = 2, b: int = 1):
+        super().__init__()
+        t = int(abs((math.log2(channels) + b) / gamma))
+        k = t if t % 2 else t + 1
+        k = max(k, 3)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k, padding=k // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        y = self.avg_pool(x)
+        y = y.squeeze(-1).transpose(-1, -2)
+        y = self.conv(y)
+        y = y.transpose(-1, -2).unsqueeze(-1)
+        return x * self.sigmoid(y)
+
+
+def build_attention(channels: int, attn: str = "se", **kwargs) -> nn.Module:
+    attn = attn.lower().strip()
+    if attn == "se":
+        return SEBlock(channels, **kwargs)
+    elif attn == "eca":
+        return ECABlock(channels, **kwargs)
+    elif attn in ("none", "identity", ""):
+        return nn.Identity()
+    else:
+        raise ValueError(f"不支持的注意力: '{attn}'，可选 'se'/'eca'/'none'")
+
+
+# ============================================================
+# Residual Shared Spatial Gate
+# ============================================================
+
+class SpatialGate(nn.Module):
+    """
+    残差共享式空间门控：
+        output = x * (1 + scale * gate)
+
+    gate  = tanh(shared_map), shape=[B,1,H,W]
+    scale = max_scale * tanh(self.scale)
+    初始严格恒等：self.scale = 0
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        gate_k: int = 5,
+        reduction: int = 4,
+        max_scale: float = 0.5,
+    ):
+        super().__init__()
+        gate_k = _validate_positive_odd("gate_k", gate_k)
+        if max_scale <= 0:
+            raise ValueError(f"max_scale 必须 > 0，当前为 {max_scale}")
+
+        mid = max(channels // reduction, 8)
+        self.channels = channels
+        self.max_scale = float(max_scale)
+
+        self.spatial = nn.Sequential(
+            nn.Conv2d(
+                channels,
+                channels,
+                gate_k,
+                padding=gate_k // 2,
+                groups=channels,
+                bias=False,
+            ),
+            nn.BatchNorm2d(channels),
+            nn.SiLU(inplace=False),
+        )
+
+        self.channel = nn.Sequential(
+            nn.Conv2d(channels, mid, 1, bias=False),
+            nn.SiLU(inplace=False),
+            nn.Conv2d(mid, 1, 1, bias=True),
+        )
+
+        nn.init.normal_(self.channel[-1].weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.channel[-1].bias)
+        self.scale = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate = torch.tanh(self.channel(self.spatial(x)))
+        scale = self.max_scale * torch.tanh(self.scale)
+        return x * (1.0 + scale * gate)
+
+    def extra_repr(self) -> str:
+        k = self.spatial[0].kernel_size[0]
+        mid = self.channel[0].out_channels
+        return (
+            f"channels={self.channels}, gate_k={k}, mid={mid}, "
+            f"max_scale={self.max_scale}"
+        )
+
+
+# ============================================================
+# DilatedReparamBlock
+# ============================================================
+
+class DilatedReparamBlock(nn.Module):
+    """
+    CDC 并联版 Dilated Reparam Block
+    训练时：多个膨胀分支 + 1x1 分支 + CDC 分支
+    部署时：融合为单个 depthwise 大核卷积
+    """
+
+    def __init__(
+        self,
+        channels,
+        kernel_size,
+        deploy=False,
+        use_sync_bn=False,
+        attempt_use_lk_impl=True,
+        cdc_kernel_size=3,
+    ):
+        super().__init__()
+        self.deploy = deploy
+        self.attempt_use_lk_impl = attempt_use_lk_impl
+        self.kernel_size = kernel_size
+        self.channels = channels
+        self.cdc_kernel_size = _validate_positive_odd("cdc_kernel_size", cdc_kernel_size)
+
+        if kernel_size not in DILATE_SETTINGS:
+            raise ValueError(f"kernel_size 须在 {list(DILATE_SETTINGS.keys())} 中")
+        self.kernel_sizes, self.dilates = DILATE_SETTINGS[kernel_size]
+
+        self.lk_origin = get_conv2d(
+            channels,
+            channels,
+            kernel_size,
+            stride=1,
+            padding=kernel_size // 2,
+            dilation=1,
+            groups=channels,
+            bias=deploy,
+            attempt_use_lk_impl=deploy and attempt_use_lk_impl,
+        )
+
+        if not deploy:
+            bn_cls = nn.SyncBatchNorm if use_sync_bn else nn.BatchNorm2d
+            self.origin_bn = bn_cls(channels)
+
+            self.dil_branches = nn.ModuleList()
+            for k, r in zip(self.kernel_sizes, self.dilates):
+                self.dil_branches.append(
+                    nn.Sequential(
+                        nn.Conv2d(
+                            channels,
+                            channels,
+                            k,
+                            stride=1,
+                            padding=r * (k - 1) // 2,
+                            dilation=r,
+                            groups=channels,
+                            bias=False,
+                        ),
+                        bn_cls(channels),
+                    )
+                )
+
+            self.branch_1x1 = nn.Sequential(
+                nn.Conv2d(
+                    channels,
+                    channels,
+                    1,
+                    stride=1,
+                    padding=0,
+                    groups=channels,
+                    bias=False,
+                ),
+                bn_cls(channels),
+            )
+
+            self.branch_cdc = nn.Sequential(
+                nn.Conv2d(
+                    channels,
+                    channels,
+                    self.cdc_kernel_size,
+                    stride=1,
+                    padding=self.cdc_kernel_size // 2,
+                    dilation=1,
+                    groups=channels,
+                    bias=False,
+                ),
+                bn_cls(channels),
+            )
+
+            self.theta_cdc = nn.Parameter(torch.zeros(channels))
+
+    @staticmethod
+    def _cdc_conv(conv, x, theta):
+        y = conv(x)
+        w_sum = conv.weight.sum(dim=[1, 2, 3])
+        correction = (theta * w_sum).view(1, -1, 1, 1) * x
+        return y - correction
+
+    def forward(self, x):
+        if self.deploy:
+            return self.lk_origin(x)
+
+        out = self.origin_bn(self.lk_origin(x))
+        for branch in self.dil_branches:
+            out = out + branch(x)
+        out = out + self.branch_1x1(x)
+        out = out + self.branch_cdc[1](self._cdc_conv(self.branch_cdc[0], x, self.theta_cdc))
+        return out
+
+    @torch.no_grad()
+    def merge_dilated_branches(self, force_plain_conv=False):
+        if self.deploy:
+            return
+
+        origin_k, origin_b = fuse_bn(self.lk_origin, self.origin_bn)
+
+        for r, branch in zip(self.dilates, self.dil_branches):
+            br_k, br_b = fuse_bn(branch[0], branch[1])
+            origin_k = merge_dilated_into_large_kernel(origin_k, br_k, r)
+            origin_b += br_b
+
+        k_1x1, b_1x1 = fuse_bn(self.branch_1x1[0], self.branch_1x1[1])
+        origin_k = merge_dilated_into_large_kernel(origin_k, k_1x1, 1)
+        origin_b += b_1x1
+
+        cdc_k, cdc_b = fuse_bn(self.branch_cdc[0], self.branch_cdc[1])
+        cdc_k = _apply_cdc_theta(cdc_k, self.theta_cdc.detach())
+        origin_k = merge_dilated_into_large_kernel(origin_k, cdc_k, 1)
+        origin_b += cdc_b
+
+        merged = get_conv2d(
+            origin_k.size(0),
+            origin_k.size(0),
+            origin_k.size(2),
+            stride=1,
+            padding=origin_k.size(2) // 2,
+            dilation=1,
+            groups=origin_k.size(0),
+            bias=True,
+            attempt_use_lk_impl=(self.attempt_use_lk_impl and not force_plain_conv),
+        ).to(device=origin_k.device, dtype=origin_k.dtype)
+
+        if isinstance(merged, nn.Conv2d):
+            merged.weight.copy_(origin_k)
+            merged.bias.copy_(origin_b)
+        else:
+            if hasattr(merged, "weight"):
+                merged.weight.copy_(origin_k)
+            else:
+                raise RuntimeError("LK impl 缺少 weight 属性，无法融合")
+
+            if hasattr(merged, "bias") and merged.bias is not None:
+                merged.bias.copy_(origin_b)
+            elif origin_b.abs().max() > 1e-6:
+                warnings.warn(
+                    f"LK impl 不支持 bias，但 bias 范数为 {origin_b.abs().max():.4e}，融合结果可能不等价！",
+                    UserWarning,
+                )
+
+        self.lk_origin = merged
+        for attr in ("origin_bn", "dil_branches", "branch_1x1", "branch_cdc", "theta_cdc"):
+            if hasattr(self, attr):
+                delattr(self, attr)
+
+        self.deploy = True
+
+    def fuse_convs(self, force_plain_conv=False):
+        self.merge_dilated_branches(force_plain_conv=force_plain_conv)
+
+    def extra_repr(self):
+        return (
+            f"channels={self.channels}, kernel_size={self.kernel_size}, "
+            f"cdc_kernel_size={self.cdc_kernel_size}, deploy={self.deploy}"
+        )
+
+
+# ============================================================
+# Context Residual Large-Kernel Block
+# ============================================================
+
+class ContextResidualLargeKernelBlock(nn.Module):
+    """
+    full-channel local + large-kernel context residual
+
+    数据流:
+        u = cv1(x)
+        l = u + dw3x3(u)
+
+        g = rep_lk(u)
+        g = attn_g(g)
+        g = post_bn_g(g)
+        g = spatial_gate_g(g)   # 可选
+
+        y = l + gamma * g       # gamma = 0 初始化
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        kernel_size: int,
+        deploy: bool = False,
+        use_sync_bn: bool = False,
+        attempt_use_lk_impl: bool = True,
+        cdc_kernel_size: int = 3,
+        attn: str = "se",
+        use_gate: bool = False,
+        gate_k: int = 5,
+        local_k: int = 3,
+        gamma_per_channel: bool = True,
+    ):
+        super().__init__()
+        local_k = _validate_positive_odd("local_k", local_k)
+        bn_cls = nn.SyncBatchNorm if use_sync_bn else nn.BatchNorm2d
+
+        self.channels = channels
+        self.kernel_size = kernel_size
+        self.deploy = deploy
+        self.use_gate = use_gate
+
+        # local/detail path
+        self.local_dw = nn.Sequential(
+            nn.Conv2d(
+                channels,
+                channels,
+                local_k,
+                stride=1,
+                padding=local_k // 2,
+                groups=channels,
+                bias=False,
+            ),
+            bn_cls(channels),
+        )
+
+        # context path
+        self.rep_lk = DilatedReparamBlock(
+            channels,
+            kernel_size,
+            deploy=deploy,
+            use_sync_bn=use_sync_bn,
+            attempt_use_lk_impl=attempt_use_lk_impl,
+            cdc_kernel_size=cdc_kernel_size,
+        )
+
+        self.attn_g = build_attention(channels, attn)
+        self.post_bn_g = bn_cls(channels)
+
+        if use_gate:
+            self.spatial_gate_g = SpatialGate(channels, gate_k=gate_k)
+
+        if gamma_per_channel:
+            self.gamma = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        else:
+            self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, u: torch.Tensor) -> torch.Tensor:
+        l = u + self.local_dw(u)
+
+        g = self.rep_lk(u)
+        g = self.attn_g(g)
+        g = self.post_bn_g(g)
+        if self.use_gate:
+            g = self.spatial_gate_g(g)
+
+        return l + self.gamma * g
+
+    def fuse_convs(self, force_plain_conv: bool = False):
+        self.rep_lk.fuse_convs(force_plain_conv=force_plain_conv)
+        self.deploy = True
+
+    def extra_repr(self):
+        return (
+            f"channels={self.channels}, kernel_size={self.kernel_size}, "
+            f"deploy={self.deploy}, use_gate={self.use_gate}"
+        )
+
+
+# ============================================================
+# Bottleneck / C3k2
+# ============================================================
+
+class UniRepBottleneck_CR(nn.Module):
+    """
+    推荐版：
+        cv1(act=False) -> ContextResidualLK -> SiLU -> cv2(act=False)
+    """
+
+    def __init__(
+        self,
+        c1,
+        c2,
+        shortcut=True,
+        e=0.5,
+        k=13,
+        deploy=False,
+        attn="se",
+        use_gate=False,
+        gate_k=5,
+        local_k=3,
+        use_sync_bn=False,
+        attempt_use_lk_impl=True,
+        cdc_kernel_size=3,
+        gamma_per_channel=True,
+    ):
+        super().__init__()
+        self.deploy = deploy
+        c_ = int(c2 * e)
+
+        self.cv1 = Conv(c1, c_, 1, 1, act=False)
+
+        self.ctx = ContextResidualLargeKernelBlock(
+            channels=c_,
+            kernel_size=k,
+            deploy=deploy,
+            use_sync_bn=use_sync_bn,
+            attempt_use_lk_impl=attempt_use_lk_impl,
+            cdc_kernel_size=cdc_kernel_size,
+            attn=attn,
+            use_gate=use_gate,
+            gate_k=gate_k,
+            local_k=local_k,
+            gamma_per_channel=gamma_per_channel,
+        )
+
+        self.act = nn.SiLU(inplace=True)
+        self.cv2 = Conv(c_, c2, 1, 1, act=False)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        u = self.cv1(x)
+        out = self.ctx(u)
+        out = self.act(out)
+        out = self.cv2(out)
+        return x + out if self.add else out
+
+    def fuse_convs(self, force_plain_conv=False):
+        self.ctx.fuse_convs(force_plain_conv=force_plain_conv)
+        self.deploy = True
+
+
+class C3k2_UniRep_CR(C2f):
+    """
+    标准 Ultralytics repeat-module 风格：
+    YAML args 写法：
+        [c2, shortcut, e, k, deploy, attn, use_gate, gate_k, local_k]
+    n 由外层 repeats 控制
+    """
+
+    def __init__(
+        self,
+        c1,
+        c2,
+        n=1,
+        shortcut=False,
+        e=0.5,
+        k=13,
+        deploy=False,
+        attn="se",
+        use_gate=False,
+        gate_k=5,
+        local_k=3,
+    ):
+        super().__init__(c1, c2, n=n, shortcut=shortcut, g=1, e=e)
+        self.deploy = deploy
+
+        self.m = nn.ModuleList(
+            UniRepBottleneck_CR(
+                self.c,
+                self.c,
+                shortcut=shortcut,
+                e=1.0,
+                k=k,
+                deploy=deploy,
+                attn=attn,
+                use_gate=use_gate,
+                gate_k=gate_k,
+                local_k=local_k,
+            )
+            for _ in range(n)
+        )
+
+    def fuse_convs(self, force_plain_conv=False):
+        for m in self.m:
+            if hasattr(m, "fuse_convs"):
+                m.fuse_convs(force_plain_conv=force_plain_conv)
+        self.deploy = True
+
+
+# ============================================================
+# pose 正样本扩展 helper
+# ============================================================
+
+@torch.no_grad()
+def build_pose_supervision_mask(
+    anchor_points: torch.Tensor,   # [A, 2]
+    stride_tensor: torch.Tensor,   # [A, 1] or [A]
+    gt_bboxes: torch.Tensor,       # [B, M, 4], xyxy(image coords)
+    mask_gt: torch.Tensor,         # [B, M, 1] or [B, M]
+    fg_mask: torch.Tensor,         # [B, A]
+    target_gt_idx: torch.Tensor,   # [B, A]
+    allowed_strides=(8, 16),
+    center_radius: float = 1.5,
+    extra_weight: float = 0.5,
+):
+    """
+    pose_mask = fg_mask | center_3x3_mask
+
+    返回:
+        pose_mask:       [B, A]
+        pose_gt_idx:     [B, A]
+        pose_weight:     [B, A]
+        extra_pose_mask: [B, A]
+    """
+    B, M, _ = gt_bboxes.shape
+    A = anchor_points.shape[0]
+
+    if stride_tensor.ndim == 2:
+        stride = stride_tensor.view(-1)
+    else:
+        stride = stride_tensor
+
+    valid_gt = mask_gt.squeeze(-1).bool() if mask_gt.ndim == 3 else mask_gt.bool()
+
+    anchor_points_img = anchor_points * stride.unsqueeze(-1)  # [A,2]
+    gt_centers = 0.5 * (gt_bboxes[..., 0:2] + gt_bboxes[..., 2:4])  # [B,M,2]
+
+    stride_ok = torch.zeros_like(stride, dtype=torch.bool)
+    for s in allowed_strides:
+        stride_ok |= (stride == float(s)) | (stride == int(s))
+    stride_ok = stride_ok.view(1, A, 1)
+
+    dx = (anchor_points_img[None, :, None, 0] - gt_centers[:, None, :, 0]).abs()  # [B,A,M]
+    dy = (anchor_points_img[None, :, None, 1] - gt_centers[:, None, :, 1]).abs()  # [B,A,M]
+
+    r = center_radius * stride.view(1, A, 1)
+    center_3x3 = (dx <= r) & (dy <= r) & stride_ok & valid_gt[:, None, :]
+
+    # 不覆盖已有 detector fg
+    center_3x3 = center_3x3 & (~fg_mask[:, :, None])
+
+    dist2 = dx.square() + dy.square()
+    dist2 = dist2.masked_fill(~center_3x3, float("inf"))
+    nearest_gt = dist2.argmin(dim=-1)
+    extra_pose_mask = center_3x3.any(dim=-1)
+
+    pose_mask = fg_mask | extra_pose_mask
+    pose_gt_idx = target_gt_idx.clone()
+    pose_gt_idx[extra_pose_mask] = nearest_gt[extra_pose_mask]
+
+    pose_weight = fg_mask.float() + extra_pose_mask.float() * float(extra_weight)
+    return pose_mask, pose_gt_idx, pose_weight, extra_pose_mask
+
+
+# ============================================================
+# 全模型重参数化
+# ============================================================
+
+def reparameterize_unirep_model(model, force_plain_conv_for_export=True):
+    was_training = model.training
+    model.eval()
+
+    for m in model.modules():
+        if isinstance(m, DilatedReparamBlock) and not m.deploy:
+            m.merge_dilated_branches(force_plain_conv=force_plain_conv_for_export)
+
+    for mod in model.modules():
+        if isinstance(
+            mod,
+            (
+                DilatedReparamBlock,
+                ContextResidualLargeKernelBlock,
+                UniRepBottleneck_CR,
+                C3k2_UniRep_CR,
+            ),
+        ):
+            mod.deploy = True
+
+    if was_training:
+        warnings.warn("模型已不可逆融合，请保持 eval 模式。", UserWarning)
+    return model
+```
+
+---
+
+# 2. 合入 `ultralytics/nn/modules/__init__.py`
+
+把新模块导出。
+
+```python
+from .unirep_cr import (
+    C3k2_UniRep_CR,
+    ContextResidualLargeKernelBlock,
+    DilatedReparamBlock,
+    UniRepBottleneck_CR,
+    build_pose_supervision_mask,
+    reparameterize_unirep_model,
+)
+```
+
+然后把这些名字加到 `__all__` 里：
+
+```python
+"C3k2_UniRep_CR",
+"ContextResidualLargeKernelBlock",
+"DilatedReparamBlock",
+"UniRepBottleneck_CR",
+"build_pose_supervision_mask",
+"reparameterize_unirep_model",
+```
+
+---
+
+# 3. 合入 `ultralytics/nn/tasks.py`
+
+这里要做两件事：
+
+## 3.1 在 import 区域把类引进来
+
+找到从 `ultralytics.nn.modules` 导入模块的地方，加上：
+
+```python
+from ultralytics.nn.modules import C3k2_UniRep_CR, UniRepBottleneck_CR
+```
+
+## 3.2 在 `parse_model()` 里注册
+
+如果你这份框架是标准 Ultralytics 结构，`parse_model()` 里会有 `base_modules` 和 `repeat_modules`。
+
+把它们加进去：
+
+```python
+base_modules = frozenset({
+    # 原有模块 ...
+    UniRepBottleneck_CR,
+    C3k2_UniRep_CR,
+})
+```
+
+```python
+repeat_modules = frozenset({
+    # 原有 repeat 模块 ...
+    C3k2_UniRep_CR,
+})
+```
+
+### 这一步很重要
+
+这样之后你就能按**标准 Ultralytics YAML 写法**来写：
+
+* `n` 由外层 `repeats` 控制
+* `args` 里**不要再手动再写一个 n**
+
+---
+
+# 4. `head.py` 这轮不用改
+
+你贴的 `Pose26` head 已经够用了。
+因为训练时它已经输出：
+
+* `preds["boxes"]`
+* `preds["scores"]`
+* `preds["feats"]`
+* `preds["kpts"]`
+* `preds["kpts_sigma"]`
+
+所以 **1/2 在 block 里完成，4 在 loss 里完成**，head 不用再动。
+
+---
+
+# 5. 合入 `loss.py` / `PoseLoss26`
+
+你没贴 `PoseLoss26` 全文件，所以这里我给的是**可直接粘进去的完整补丁段**。
+如果你的 loss 文件叫别的名字，照样改同一处逻辑。
+
+---
+
+## 5.1 先加 import
+
+在 loss 文件顶部加：
+
+```python
+from ultralytics.nn.modules import build_pose_supervision_mask
+from ultralytics.utils.tal import make_anchors
+```
+
+---
+
+## 5.2 在 `PoseLoss26.__call__()` 里，先把 preds 展开
+
+放在进入 loss 主体后，最前面这段：
+
+```python
+if isinstance(preds, tuple):
+    preds = preds[1]
+
+if isinstance(preds, dict) and "one2many" in preds:
+    preds = preds["one2many"]
+
+feats = preds["feats"]                       # list[P3,P4,P5]
+pred_distri = preds["boxes"]                # [B, 4*reg_max, A]
+pred_scores = preds["scores"]               # [B, nc, A]
+pred_kpts = preds["kpts"]                   # [B, nk, A]
+pred_kpts_sigma = preds.get("kpts_sigma")   # [B, nk_sigma, A] or None
+
+bs = pred_scores.shape[0]
+nk = self.kpt_shape[0]
+ndim = self.kpt_shape[1]
+
+pred_scores = pred_scores.permute(0, 2, 1).contiguous()   # [B, A, nc]
+pred_distri = pred_distri.permute(0, 2, 1).contiguous()   # [B, A, 4*reg_max]
+pred_kpts = pred_kpts.permute(0, 2, 1).contiguous().view(bs, -1, nk, ndim)  # [B, A, K, D]
+
+if pred_kpts_sigma is not None:
+    pred_kpts_sigma = pred_kpts_sigma.permute(0, 2, 1).contiguous().view(bs, -1, nk, 2)
+```
+
+---
+
+## 5.3 生成 anchors，decode box，跑原 assigner
+
+```python
+anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)   # [A,2], [A,1]
+
+pred_bboxes = self.bbox_decode(anchor_points, pred_distri)             # [B, A, 4]
+
+target_labels, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
+    pred_scores.detach().sigmoid(),
+    (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+    anchor_points * stride_tensor,
+    gt_labels,
+    gt_bboxes,
+    mask_gt,
+)
+```
+
+---
+
+## 5.4 pose 额外正样本
+
+紧接着加：
+
+```python
+pose_mask, pose_gt_idx, pose_weight, extra_pose_mask = build_pose_supervision_mask(
+    anchor_points=anchor_points,
+    stride_tensor=stride_tensor,
+    gt_bboxes=gt_bboxes,
+    mask_gt=mask_gt,
+    fg_mask=fg_mask,
+    target_gt_idx=target_gt_idx,
+    allowed_strides=(8, 16),   # 先只扩 P3/P4
+    center_radius=1.5,
+    extra_weight=0.5,
+)
+```
+
+---
+
+## 5.5 box / cls 继续只吃 `fg_mask`
+
+这一段你原逻辑不要改成 `pose_mask`。
+也就是：
+
+* `loss_box` 还是原 `fg_mask`
+* `loss_cls` 还是原 `fg_mask`
+
+这是你要的“部分解耦”。
+
+---
+
+## 5.6 把 pose target 选择逻辑替换成 `pose_mask / pose_gt_idx`
+
+把你原来所有基于 `fg_mask` 和 `target_gt_idx` 的 keypoint gather 逻辑，替换成下面这段：
+
+```python
+if pose_mask.any():
+    B, A = pose_mask.shape
+    batch_idx = torch.arange(B, device=gt_bboxes.device)[:, None].expand(B, A)
+
+    assigned_gt_kpts = gt_kpts[batch_idx, pose_gt_idx]      # [B, A, K, D]
+    assigned_gt_box = gt_bboxes[batch_idx, pose_gt_idx]     # [B, A, 4]
+
+    pred_kpts_pos = pred_kpts[pose_mask]                    # [Npos, K, D]
+    gt_kpts_pos = assigned_gt_kpts[pose_mask]               # [Npos, K, D]
+    gt_box_pos = assigned_gt_box[pose_mask]                 # [Npos, 4]
+    pose_w_pos = pose_weight[pose_mask]                     # [Npos]
+
+    if pred_kpts_sigma is not None:
+        pred_sigma_pos = pred_kpts_sigma[pose_mask]         # [Npos, K, 2]
+    else:
+        pred_sigma_pos = None
+
+    anchor_points_img = (anchor_points * stride_tensor).view(1, -1, 2).expand(B, -1, 2)
+    anchor_pos = anchor_points_img[pose_mask]               # [Npos, 2]
+
+    # 这里保留你原有 PoseLoss26 的主 keypoint loss 公式
+    # 只把采样 mask / gt_idx 换成 pose_mask / pose_gt_idx
+    #
+    # 例：
+    # loc_loss = self.kpts_loss(pred_kpts_pos, gt_kpts_pos, anchor_pos, gt_box_pos, pred_sigma_pos)
+    loc_loss = self.kpts_loss(pred_kpts_pos, gt_kpts_pos, anchor_pos, gt_box_pos, pred_sigma_pos)
+
+    while loc_loss.ndim > 1:
+        loc_loss = loc_loss.mean(dim=-1)
+
+    loss_pose = (loc_loss * pose_w_pos).sum() / pose_w_pos.sum().clamp_min(1.0)
+
+    if pred_kpts_pos.shape[-1] > 2 and gt_kpts_pos.shape[-1] > 2:
+        vis_tgt = (gt_kpts_pos[..., 2] > 0).float()
+        vis_pred = pred_kpts_pos[..., 2]
+        vis_loss = F.binary_cross_entropy_with_logits(vis_pred, vis_tgt, reduction="none").mean(dim=-1)
+        loss_pose_obj = (vis_loss * pose_w_pos).sum() / pose_w_pos.sum().clamp_min(1.0)
+    else:
+        loss_pose_obj = pred_kpts_pos.new_tensor(0.0)
+
+else:
+    loss_pose = pred_kpts.new_tensor(0.0)
+    loss_pose_obj = pred_kpts.new_tensor(0.0)
+```
+
+---
+
+# 6. YAML 怎么写
+
+你现在如果按**标准 Ultralytics repeat 风格**接进 `parse_model()`，就这么写：
+
+```yaml
+# 例子：把 neck/backbone 里的某个 C3k2 替成 Context Residual 版
+- [-1, 2, C3k2_UniRep_CR, [256, True, 0.5, 13, False, 'se', False, 5, 3]]
+```
+
+参数顺序是：
+
+```python
+[c2, shortcut, e, k, deploy, attn, use_gate, gate_k, local_k]
+```
+
+外面的 `2` 才是 repeats，也就是 `n=2`。
+
+---
+
+# 7. 推荐先跑的配置
+
+第一轮先别把变量开太多，建议：
+
+```python
+attn = "se"
+use_gate = False
+local_k = 3
+k = 13
+allowed_strides = (8, 16)
+center_radius = 1.5
+extra_weight = 0.5
+```
+
+也就是：
+
+* block 用 `C3k2_UniRep_CR`
+* `SE` 只在 `g` 分支
+* `SpatialGate` 先关
+* pose extra positives 先只开 `P3/P4`
+
+---
+
+# 8. 最稳的合入顺序
+
+### 第一步
+
+加新文件：
+
+* `ultralytics/nn/modules/unirep_cr.py`
+
+### 第二步
+
+改导出：
+
+* `ultralytics/nn/modules/__init__.py`
+
+### 第三步
+
+改 parser 注册：
+
+* `ultralytics/nn/tasks.py`
+
+### 第四步
+
+改 loss：
+
+* `ultralytics/utils/loss.py` 里的 `PoseLoss26`
+
+### 第五步
+
+改 YAML，把目标模块换成：
+
+* `C3k2_UniRep_CR`
+
+### 第六步
+
+训练时先验证两件事
+
+1. `box/cls loss` 跟旧版是否数值正常
+2. `pose extra positives` 的数量是否真的 > `fg_mask`
+
+你可以在 loss 里临时打印：
+
+```python
+print("fg:", fg_mask.sum().item(), "pose:", pose_mask.sum().item(), "extra:", extra_pose_mask.sum().item())
+```
+
+正常应该看到：
+
+* `pose >= fg`
+* `extra > 0`
+
+---
+
+# 9. 一个容易踩坑的点
+
+如果你以前的自定义 `C3k2_UniRep` 是把 `n` 也写进 `args` 里，那这次接成标准 `repeat_modules` 后，**YAML 里就不要再手写 n 了**，不然会重复。
+
+也就是不要这样写：
+
+```yaml
+- [-1, 2, C3k2_UniRep_CR, [256, 2, True, 0.5, 13, False, 'se', False, 5, 3]]
+```
+
+这个是错的。
+
+---
+
+如果你把 `PoseLoss26` 那个文件也贴出来，我可以直接按你现有代码风格给你出一版**完整替换后的 loss 文件**。
