@@ -567,7 +567,7 @@ def build_pose_supervision_mask(
     extra_pose_mask = center_3x3.any(dim=-1)
 
     pose_mask = fg_mask | extra_pose_mask
-    pose_gt_idx = target_gt_idx.clone()
+    pose_gt_idx = target_gt_idx.to(dtype=torch.long).clone()
     pose_gt_idx[extra_pose_mask] = nearest_gt[extra_pose_mask]
     pose_weight = fg_mask.float() + extra_pose_mask.float() * float(extra_weight)
     return pose_mask, pose_gt_idx, pose_weight, extra_pose_mask

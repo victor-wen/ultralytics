@@ -871,7 +871,7 @@ class PoseLoss26(v8PoseLoss):
         if keypoints.numel() == 0:
             return keypoints.new_zeros((batch_size, 0, 0, 0))
 
-        batch_idx = batch_idx.view(-1)
+        batch_idx = batch_idx.view(-1).to(dtype=torch.long)
         counts = torch.bincount(batch_idx, minlength=batch_size)
         max_kpts = int(counts.max().item()) if counts.numel() else 0
         gt_kpts = keypoints.new_zeros((batch_size, max_kpts, keypoints.shape[1], keypoints.shape[2]))
@@ -965,6 +965,7 @@ class PoseLoss26(v8PoseLoss):
 
         b, a = pose_mask.shape
         batch_idx = torch.arange(b, device=gt_bboxes.device)[:, None].expand(b, a)
+        pose_gt_idx = pose_gt_idx.to(dtype=torch.long)
         assigned_gt_kpts = gt_kpts[batch_idx, pose_gt_idx].clone()
         assigned_gt_box = gt_bboxes[batch_idx, pose_gt_idx].clone()
 
