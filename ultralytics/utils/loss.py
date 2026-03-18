@@ -321,14 +321,26 @@ class KeypointLoss(nn.Module):
         self.sigmas = sigmas
 
     def forward(
-        self, pred_kpts: torch.Tensor, gt_kpts: torch.Tensor, kpt_mask: torch.Tensor, area: torch.Tensor
+        self,
+        pred_kpts: torch.Tensor,
+        gt_kpts: torch.Tensor,
+        kpt_mask: torch.Tensor,
+        area: torch.Tensor,
+        reduction: str = "mean",
     ) -> torch.Tensor:
         """Calculate keypoint loss factor and Euclidean distance loss for keypoints."""
         d = (pred_kpts[..., 0] - gt_kpts[..., 0]).pow(2) + (pred_kpts[..., 1] - gt_kpts[..., 1]).pow(2)
         kpt_loss_factor = kpt_mask.shape[1] / (torch.sum(kpt_mask != 0, dim=1) + 1e-9)
         # e = d / (2 * (area * self.sigmas) ** 2 + 1e-9)  # from formula
         e = d / ((2 * self.sigmas).pow(2) * (area + 1e-9) * 2)  # from cocoeval
-        return (kpt_loss_factor.view(-1, 1) * ((1 - torch.exp(-e)) * kpt_mask)).mean()
+        loss = kpt_loss_factor.view(-1, 1) * ((1 - torch.exp(-e)) * kpt_mask)
+        if reduction == "mean":
+            return loss.mean()
+        if reduction == "none":
+            return loss.mean(dim=-1)
+        if reduction == "sum":
+            return loss.sum()
+        raise ValueError(f"Unsupported keypoint loss reduction: {reduction}")
 
 
 class v8DetectionLoss:
@@ -773,7 +785,7 @@ class v8PoseLoss(v8DetectionLoss):
             gt_kpt = selected_keypoints[masks]
             area = xyxy2xywh(target_bboxes[masks])[:, 2:].prod(1, keepdim=True)
             pred_kpt = pred_kpts[masks]
-            kpt_mask = gt_kpt[..., 2] != 0 if gt_kpt.shape[-1] == 3 else torch.full_like(gt_kpt[..., 0], True)
+            kpt_mask = gt_kpt[..., 2] != 0 if gt_kpt.shape[-1] == 3 else torch.ones_like(gt_kpt[..., 0], dtype=torch.bool)
             kpts_loss = self.keypoint_loss(pred_kpt, gt_kpt, kpt_mask, area)  # pose loss
 
             if pred_kpt.shape[-1] == 3:
@@ -889,7 +901,9 @@ class PoseLoss26(v8PoseLoss):
         y[..., 1] += anchor_points[:, [1]]
         return y
 
-    def calculate_rle_loss(self, pred_kpt: torch.Tensor, gt_kpt: torch.Tensor, kpt_mask: torch.Tensor) -> torch.Tensor:
+    def calculate_rle_loss(
+        self, pred_kpt: torch.Tensor, gt_kpt: torch.Tensor, kpt_mask: torch.Tensor, reduction: str = "mean"
+    ) -> torch.Tensor:
         """Calculate the RLE (Residual Log-likelihood Estimation) loss for keypoints.
 
         Args:
@@ -900,31 +914,43 @@ class PoseLoss26(v8PoseLoss):
         Returns:
             (torch.Tensor): The RLE loss.
         """
-        pred_kpt_visible = pred_kpt[kpt_mask]
-        gt_kpt_visible = gt_kpt[kpt_mask]
-        pred_coords = pred_kpt_visible[:, 0:2]
-        pred_sigma = pred_kpt_visible[:, -2:]
-        gt_coords = gt_kpt_visible[:, 0:2]
-
-        target_weights = self.target_weights.unsqueeze(0).repeat(kpt_mask.shape[0], 1)
-        target_weights = target_weights[kpt_mask]
-
-        pred_sigma = pred_sigma.sigmoid()
+        pred_sigma = pred_kpt[..., -2:].sigmoid()
+        pred_coords = pred_kpt[..., 0:2]
+        gt_coords = gt_kpt[..., 0:2]
         error = (pred_coords - gt_coords) / (pred_sigma + 1e-9)
 
-        # Filter out NaN and Inf values to prevent MultivariateNormal validation errors
-        valid_mask = ~(torch.isnan(error) | torch.isinf(error)).any(dim=-1)
+        # Filter out NaN and Inf values to prevent MultivariateNormal validation errors.
+        valid_mask = kpt_mask & (~(torch.isnan(error) | torch.isinf(error)).any(dim=-1))
         if not valid_mask.any():
-            return torch.tensor(0.0, device=pred_kpt.device)
+            if reduction == "none":
+                return pred_kpt.new_zeros((kpt_mask.shape[0],))
+            return pred_kpt.new_tensor(0.0)
 
-        error = error[valid_mask]
-        error = error.clamp(-100, 100)  # Prevent numerical instability
-        pred_sigma = pred_sigma[valid_mask]
-        target_weights = target_weights[valid_mask]
+        error = error.clamp(-100, 100)  # Prevent numerical instability.
+        error_visible = error[valid_mask]
+        pred_sigma_visible = pred_sigma[valid_mask]
+        target_weights = self.target_weights.unsqueeze(0).expand(kpt_mask.shape[0], -1)
+        target_weights_visible = target_weights[valid_mask]
 
-        log_phi = self.flow_model.log_prob(error)
+        log_phi = self.flow_model.log_prob(error_visible)
+        loss_visible = torch.log(pred_sigma_visible) - log_phi.unsqueeze(1)
 
-        return self.rle_loss(pred_sigma, log_phi, error, target_weights)
+        if self.rle_loss.residual:
+            loss_visible += torch.log(pred_sigma_visible * 2) + torch.abs(error_visible)
+
+        if self.rle_loss.use_target_weight:
+            loss_visible *= target_weights_visible.unsqueeze(1)
+
+        loss_visible = loss_visible.sum(dim=-1)
+        if reduction == "sum":
+            return loss_visible.sum()
+        if reduction == "mean":
+            return loss_visible.sum() / valid_mask.sum().clamp_min(1)
+        if reduction == "none":
+            loss_per_anchor = pred_kpt.new_zeros((kpt_mask.shape[0], kpt_mask.shape[1]))
+            loss_per_anchor[valid_mask] = loss_visible
+            return loss_per_anchor.sum(dim=-1) / valid_mask.sum(dim=-1).clamp_min(1)
+        raise ValueError(f"Unsupported RLE loss reduction: {reduction}")
 
     def calculate_keypoints_loss(
         self,
@@ -976,15 +1002,14 @@ class PoseLoss26(v8PoseLoss):
         pred_kpt = pred_kpts[pose_mask]
         pose_w = pose_weight[pose_mask]
         area = xyxy2xywh(assigned_gt_box[pose_mask])[:, 2:].prod(1, keepdim=True)
-        kpt_mask = gt_kpt[..., 2] != 0 if gt_kpt.shape[-1] in {3, 5} else torch.full_like(gt_kpt[..., 0], True)
+        kpt_mask = gt_kpt[..., 2] != 0 if gt_kpt.shape[-1] in {3, 5} else torch.ones_like(gt_kpt[..., 0], dtype=torch.bool)
 
-        loc_loss = self.keypoint_loss(pred_kpt, gt_kpt, kpt_mask, area)
-        while loc_loss.ndim > 1:
-            loc_loss = loc_loss.mean(dim=-1)
+        loc_loss = self.keypoint_loss(pred_kpt, gt_kpt, kpt_mask, area, reduction="none")
         kpts_loss = (loc_loss * pose_w).sum() / pose_w.sum().clamp_min(1.0)
 
         if self.rle_loss is not None and pred_kpt.shape[-1] in {4, 5}:
-            rle_loss = self.calculate_rle_loss(pred_kpt, gt_kpt, kpt_mask).clamp(min=0)
+            rle_loss = self.calculate_rle_loss(pred_kpt, gt_kpt, kpt_mask, reduction="none").clamp(min=0)
+            rle_loss = (rle_loss * pose_w).sum() / pose_w.sum().clamp_min(1.0)
 
         if pred_kpt.shape[-1] in {3, 5}:
             vis_loss = F.binary_cross_entropy_with_logits(pred_kpt[..., 2], kpt_mask.float(), reduction="none").mean(
