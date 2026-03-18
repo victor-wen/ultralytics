@@ -933,6 +933,10 @@ class PoseLoss26(v8PoseLoss):
         target_weights_visible = target_weights[valid_mask]
 
         log_phi = self.flow_model.log_prob(error_visible)
+        calc_dtype = log_phi.dtype
+        pred_sigma_visible = pred_sigma_visible.to(calc_dtype)
+        error_visible = error_visible.to(calc_dtype)
+        target_weights_visible = target_weights_visible.to(calc_dtype)
         loss_visible = torch.log(pred_sigma_visible) - log_phi.unsqueeze(1)
 
         if self.rle_loss.residual:
@@ -947,7 +951,7 @@ class PoseLoss26(v8PoseLoss):
         if reduction == "mean":
             return loss_visible.sum() / valid_mask.sum().clamp_min(1)
         if reduction == "none":
-            loss_per_anchor = pred_kpt.new_zeros((kpt_mask.shape[0], kpt_mask.shape[1]))
+            loss_per_anchor = loss_visible.new_zeros((kpt_mask.shape[0], kpt_mask.shape[1]))
             loss_per_anchor[valid_mask] = loss_visible
             return loss_per_anchor.sum(dim=-1) / valid_mask.sum(dim=-1).clamp_min(1)
         raise ValueError(f"Unsupported RLE loss reduction: {reduction}")

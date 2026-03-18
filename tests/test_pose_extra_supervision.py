@@ -82,3 +82,20 @@ def test_pose_loss26_applies_extra_weight_to_location_and_rle():
     assert weighted_losses[0] < full_losses[0]
     assert weighted_losses[1] < full_losses[1]
     assert weighted_losses[2] < full_losses[2]
+
+
+def test_pose_loss26_rle_none_handles_mixed_precision():
+    criterion = PoseLoss26.__new__(PoseLoss26)
+    criterion.rle_loss = RLELoss(use_target_weight=True)
+    criterion.target_weights = torch.ones(2)
+    criterion.flow_model = _DummyFlow()
+
+    pred_kpt = torch.tensor([[[0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 0.0, 0.0]]], dtype=torch.float16)
+    gt_kpt = torch.tensor([[[0.0, 0.0, 1.0], [1.0, 1.0, 1.0]]], dtype=torch.float32)
+    kpt_mask = torch.tensor([[True, True]])
+
+    loss = criterion.calculate_rle_loss(pred_kpt, gt_kpt, kpt_mask, reduction="none")
+
+    assert loss.shape == (1,)
+    assert loss.dtype == torch.float32
+    assert torch.isfinite(loss).all()
