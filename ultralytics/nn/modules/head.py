@@ -20,7 +20,19 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect"
+__all__ = (
+    "OBB",
+    "Classify",
+    "Detect",
+    "Pose",
+    "Pose26",
+    "PoseRTMO26",
+    "RTDETRDecoder",
+    "Segment",
+    "YOLOEDetect",
+    "YOLOESegment",
+    "v10Detect",
+)
 
 
 class Detect(nn.Module):
@@ -767,6 +779,336 @@ class Pose26(Pose):
             y[:, 0::ndim] = (y[:, 0::ndim] + self.anchors[0]) * self.strides
             y[:, 1::ndim] = (y[:, 1::ndim] + self.anchors[1]) * self.strides
             return y
+
+
+class RTMOSinePositionEncoding(nn.Module):
+    """Sine/cosine positional encoding for 1-D coordinate bins."""
+
+    def __init__(self, out_channels: int = 128, temperature: float = 300.0):
+        """Initialize the encoding with an even output dimension."""
+        super().__init__()
+        if out_channels % 2:
+            raise ValueError(f"RTMOSinePositionEncoding requires an even out_channels, but got {out_channels}.")
+        self.out_channels = out_channels
+        half_channels = out_channels // 2
+        dim_t = torch.arange(half_channels, dtype=torch.float32)
+        dim_t = temperature ** (2 * torch.div(dim_t, 2, rounding_mode="floor") / half_channels)
+        self.register_buffer("dim_t", dim_t, persistent=False)
+
+    def forward(self, position: torch.Tensor) -> torch.Tensor:
+        """Encode a tensor of positions with sine/cosine features."""
+        freq = position.unsqueeze(-1) / self.dim_t.to(position)
+        return torch.cat((freq.cos(), freq.sin()), dim=-1)
+
+
+class RTMOTokenMixer(nn.Module):
+    """A lightweight GAU-style token mixer used inside the RTMO DCC block."""
+
+    def __init__(self, channels: int, attn_channels: int | None = None):
+        """Initialize the token mixer with gated attention-style projections."""
+        super().__init__()
+        self.channels = channels
+        self.attn_channels = attn_channels or max(channels // 2, 32)
+        self.norm = nn.LayerNorm(channels)
+        self.q = nn.Linear(channels, self.attn_channels)
+        self.k = nn.Linear(channels, self.attn_channels)
+        self.uv = nn.Linear(channels, channels * 2)
+        self.proj = nn.Linear(channels, channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Mix keypoint tokens while preserving the input shape."""
+        residual = x
+        x = self.norm(x)
+        q = self.q(x)
+        k = self.k(x)
+        qk = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.attn_channels)
+        kernel = F.relu(qk).square()
+        u, v = self.uv(x).chunk(2, dim=-1)
+        x = u * torch.matmul(kernel, v)
+        return residual + self.proj(x)
+
+
+class RTMODCC(nn.Module):
+    """Dynamic Coordinate Classifier used by the RTMO pose head."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        num_keypoints: int,
+        feat_channels: int = 128,
+        num_bins: tuple[int, int] = (64, 64),
+        spe_channels: int = 128,
+        bbox_expand_ratio: float = 1.25,
+    ):
+        """Initialize the DCC module with dynamic bins and token mixing."""
+        super().__init__()
+        self.in_channels = in_channels
+        self.num_keypoints = num_keypoints
+        self.feat_channels = feat_channels
+        self.num_bins = tuple(num_bins)
+        self.bbox_expand_ratio = bbox_expand_ratio
+        self.spe = RTMOSinePositionEncoding(spe_channels)
+        self.pose_to_kpts = nn.Linear(in_channels, feat_channels * num_keypoints)
+        self.token_mixer = RTMOTokenMixer(feat_channels)
+        self.x_fc = nn.Linear(spe_channels, feat_channels)
+        self.y_fc = nn.Linear(spe_channels, feat_channels)
+        self.sigma_fc = nn.Sequential(nn.Linear(in_channels, num_keypoints), nn.Sigmoid())
+        self.register_buffer("x_bins", torch.linspace(-0.5, 0.5, self.num_bins[0]), persistent=False)
+        self.register_buffer("y_bins", torch.linspace(-0.5, 0.5, self.num_bins[1]), persistent=False)
+
+    @staticmethod
+    def _flatten_prefix(x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...]]:
+        """Flatten all leading dimensions except the last one."""
+        prefix = x.shape[:-1]
+        return x.reshape(-1, x.shape[-1]), prefix
+
+    def _bbox_center_scale(self, bboxes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convert xyxy boxes to center/scale with a positive clamped extent."""
+        center = (bboxes[..., :2] + bboxes[..., 2:]) * 0.5
+        scale = (bboxes[..., 2:] - bboxes[..., :2]).clamp(min=1e-3) * self.bbox_expand_ratio
+        return center, scale
+
+    def _get_bin_coords(self, bboxes: torch.Tensor, anchor_points: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build dynamic bin coordinates centered around the predicted box relative to each anchor."""
+        center, scale = self._bbox_center_scale(bboxes)
+        rel_center = center - anchor_points
+        prefix_dims = [1] * (rel_center.ndim - 1)
+        x_bins = self.x_bins.view(*prefix_dims, -1) * scale[..., 0:1] + rel_center[..., 0:1]
+        y_bins = self.y_bins.view(*prefix_dims, -1) * scale[..., 1:2] + rel_center[..., 1:2]
+        return x_bins, y_bins
+
+    def _pose_to_keypoint_features(self, pose_vec: torch.Tensor) -> torch.Tensor:
+        """Project pose vectors to keypoint tokens and mix them with a lightweight attention block."""
+        flat_pose, prefix = self._flatten_prefix(pose_vec)
+        kpt_feats = self.pose_to_kpts(flat_pose).view(-1, self.num_keypoints, self.feat_channels)
+        kpt_feats = self.token_mixer(kpt_feats)
+        return kpt_feats.view(*prefix, self.num_keypoints, self.feat_channels)
+
+    def _apply_softmax(self, x_hms: torch.Tensor, y_hms: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply numerically stable softmax to 1-D heatmaps."""
+        x_hms = x_hms.clamp(min=-5e4, max=5e4)
+        y_hms = y_hms.clamp(min=-5e4, max=5e4)
+        x_prob = F.softmax(x_hms - x_hms.max(dim=-1, keepdim=True).values.detach(), dim=-1)
+        y_prob = F.softmax(y_hms - y_hms.max(dim=-1, keepdim=True).values.detach(), dim=-1)
+        return x_prob, y_prob
+
+    def _decode(
+        self,
+        x_prob: torch.Tensor,
+        y_prob: torch.Tensor,
+        x_bins: torch.Tensor,
+        y_bins: torch.Tensor,
+        anchor_points: torch.Tensor,
+    ) -> torch.Tensor:
+        """Decode heatmaps to x/y coordinates through integral projection."""
+        x = (x_prob * x_bins.unsqueeze(-2)).sum(dim=-1) + anchor_points[..., 0:1]
+        y = (y_prob * y_bins.unsqueeze(-2)).sum(dim=-1) + anchor_points[..., 1:2]
+        return torch.stack((x, y), dim=-1)
+
+    def _predict(
+        self, pose_vec: torch.Tensor, bboxes: torch.Tensor, anchor_points: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the common DCC projection path."""
+        x_bins, y_bins = self._get_bin_coords(bboxes, anchor_points)
+        x_bins_enc = self.x_fc(self.spe(x_bins))
+        y_bins_enc = self.y_fc(self.spe(y_bins))
+        kpt_feats = self._pose_to_keypoint_features(pose_vec)
+        x_hms = torch.matmul(kpt_feats, x_bins_enc.transpose(-1, -2).contiguous())
+        y_hms = torch.matmul(kpt_feats, y_bins_enc.transpose(-1, -2).contiguous())
+        x_prob, y_prob = self._apply_softmax(x_hms, y_hms)
+        return x_prob, y_prob, x_bins, y_bins, self.sigma_fc(pose_vec).clamp(min=1e-4)
+
+    def forward_train(
+        self, pose_vec: torch.Tensor, bboxes: torch.Tensor, anchor_points: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Decode coordinates and return training auxiliaries for MLE supervision."""
+        x_prob, y_prob, x_bins, y_bins, sigma = self._predict(pose_vec, bboxes, anchor_points)
+        coords = self._decode(x_prob, y_prob, x_bins, y_bins, anchor_points)
+        return coords, {"x_prob": x_prob, "y_prob": y_prob, "x_bins": x_bins, "y_bins": y_bins, "sigma": sigma}
+
+    @torch.no_grad()
+    def forward_test(self, pose_vec: torch.Tensor, bboxes: torch.Tensor, anchor_points: torch.Tensor) -> torch.Tensor:
+        """Decode coordinates for inference."""
+        x_prob, y_prob, x_bins, y_bins, _ = self._predict(pose_vec, bboxes, anchor_points)
+        return self._decode(x_prob, y_prob, x_bins, y_bins, anchor_points)
+
+
+class PoseRTMO26(Detect):
+    """RTMO-style YOLO26 pose head with dynamic coordinate classification."""
+
+    def __init__(
+        self,
+        nc: int = 80,
+        kpt_shape: tuple = (17, 3),
+        num_bins: tuple[int, int] = (64, 64),
+        bbox_expand_ratio: float = 1.25,
+        pose_vec_channels: int = 512,
+        reg_max=16,
+        end2end=False,
+        ch: tuple = (),
+    ):
+        """Initialize the RTMO-style pose head."""
+        super().__init__(nc, reg_max, end2end, ch)
+        self.kpt_shape = kpt_shape
+        self.nk = kpt_shape[0] * kpt_shape[1]
+        self.num_bins = tuple(num_bins)
+        self.pose_vec_channels = pose_vec_channels
+        self.has_visible = kpt_shape[1] == 3
+        pose_feat_channels = max(ch[0] // 2, 128)
+        self.pose_feat_channels = pose_feat_channels
+        self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, pose_feat_channels, 3), Conv(pose_feat_channels, pose_feat_channels, 3)) for x in ch)
+        self.cv4_proxy = nn.ModuleList(nn.Conv2d(pose_feat_channels, kpt_shape[0] * 2, 1) for _ in ch)
+        self.cv4_pose_vec = nn.ModuleList(nn.Conv2d(pose_feat_channels, pose_vec_channels, 1) for _ in ch)
+        self.cv4_vis = (
+            nn.ModuleList(nn.Conv2d(pose_feat_channels, kpt_shape[0], 1) for _ in ch) if self.has_visible else None
+        )
+        self.dcc = RTMODCC(
+            in_channels=pose_vec_channels,
+            num_keypoints=kpt_shape[0],
+            feat_channels=max(pose_vec_channels // 4, 64),
+            num_bins=self.num_bins,
+            bbox_expand_ratio=bbox_expand_ratio,
+        )
+
+        if end2end:
+            self.one2one_cv4 = copy.deepcopy(self.cv4)
+            self.one2one_cv4_proxy = copy.deepcopy(self.cv4_proxy)
+            self.one2one_cv4_pose_vec = copy.deepcopy(self.cv4_pose_vec)
+            self.one2one_cv4_vis = copy.deepcopy(self.cv4_vis) if self.cv4_vis is not None else None
+
+        self._rtmo_cached: dict[str, torch.Tensor] | None = None
+        self._rtmo_anchor_points = torch.empty(0)
+
+    @property
+    def one2many(self):
+        """Returns the one-to-many RTMO head components."""
+        return dict(
+            box_head=self.cv2,
+            cls_head=self.cv3,
+            pose_head=self.cv4,
+            proxy_head=self.cv4_proxy,
+            pose_vec_head=self.cv4_pose_vec,
+            vis_head=self.cv4_vis,
+        )
+
+    @property
+    def one2one(self):
+        """Returns the one-to-one RTMO head components."""
+        return dict(
+            box_head=self.one2one_cv2,
+            cls_head=self.one2one_cv3,
+            pose_head=self.one2one_cv4,
+            proxy_head=self.one2one_cv4_proxy,
+            pose_vec_head=self.one2one_cv4_pose_vec,
+            vis_head=self.one2one_cv4_vis,
+        )
+
+    @staticmethod
+    def _proxy_decode(anchor_points: torch.Tensor, pred_kpts: torch.Tensor) -> torch.Tensor:
+        """Decode the proxy regression branch using the YOLO pose offset parameterization."""
+        y = pred_kpts.clone()
+        y[..., 0] *= 2.0
+        y[..., 1] *= 2.0
+        y[..., 0] += anchor_points[..., 0:1] - 0.5
+        y[..., 1] += anchor_points[..., 1:2] - 0.5
+        return y
+
+    def _gather_anchor_points(self, idx: torch.Tensor) -> torch.Tensor:
+        """Gather per-anchor points in the same spatial units as the decoded boxes."""
+        anchor_points = self._rtmo_anchor_points.view(1, -1, 2).expand(idx.shape[0], -1, -1)
+        return anchor_points.gather(1, idx.repeat(1, 1, 2))
+
+    def _format_keypoints(self, coords: torch.Tensor, vis: torch.Tensor | None) -> torch.Tensor:
+        """Combine decoded coordinates and optional visibility logits into the flattened result format."""
+        if not self.has_visible:
+            return coords.reshape(coords.shape[0], coords.shape[1], -1)
+        if vis is None:
+            raise ValueError("PoseRTMO26 requires visibility predictions when kpt_shape has 3 dimensions.")
+        return torch.cat((coords, vis.sigmoid().unsqueeze(-1)), dim=-1).reshape(coords.shape[0], coords.shape[1], -1)
+
+    def forward_head(
+        self,
+        x: list[torch.Tensor],
+        box_head: torch.nn.Module,
+        cls_head: torch.nn.Module,
+        pose_head: torch.nn.Module,
+        proxy_head: torch.nn.Module,
+        pose_vec_head: torch.nn.Module,
+        vis_head: torch.nn.Module | None,
+    ) -> dict[str, torch.Tensor]:
+        """Concatenate and return detection predictions plus raw RTMO pose tensors."""
+        preds = Detect.forward_head(self, x, box_head, cls_head)
+        if pose_head is None or proxy_head is None or pose_vec_head is None:
+            return preds
+        bs = x[0].shape[0]
+        features = [pose_head[i](x[i]) for i in range(self.nl)]
+        preds["kpts_proxy"] = torch.cat(
+            [proxy_head[i](features[i]).view(bs, self.kpt_shape[0] * 2, -1) for i in range(self.nl)], dim=2
+        )
+        preds["pose_vec"] = torch.cat(
+            [pose_vec_head[i](features[i]).view(bs, self.pose_vec_channels, -1) for i in range(self.nl)], dim=2
+        )
+        if self.has_visible and vis_head is not None:
+            preds["kpts_vis"] = torch.cat(
+                [vis_head[i](features[i]).view(bs, self.kpt_shape[0], -1) for i in range(self.nl)], dim=2
+            )
+        return preds
+
+    def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Decode detection predictions and lazily decode RTMO keypoints when needed."""
+        shape = x["feats"][0].shape
+        if self.dynamic or self.shape != shape:
+            self.anchors, self.strides = (a.transpose(0, 1) for a in make_anchors(x["feats"], self.stride, 0.5))
+            self.shape = shape
+        pred_dist = self.dfl(x["boxes"])
+        dbox = self.decode_bboxes(pred_dist, self.anchors.unsqueeze(0)) * self.strides
+        self._rtmo_anchor_points = (self.anchors * self.strides).transpose(0, 1)
+
+        if self.end2end:
+            self._rtmo_cached = x
+            return torch.cat((dbox, x["scores"].sigmoid()), 1)
+
+        dbox_xyxy = dist2bbox(pred_dist, self.anchors.unsqueeze(0), xywh=False, dim=1) * self.strides
+        pose_vec = x["pose_vec"].permute(0, 2, 1).contiguous()
+        bs, num_anchors = pose_vec.shape[:2]
+        anchor_points = self._rtmo_anchor_points.view(1, num_anchors, 2).expand(bs, -1, -1)
+        coords = self.dcc.forward_test(pose_vec, dbox_xyxy.permute(0, 2, 1).contiguous(), anchor_points)
+        vis = x.get("kpts_vis", None)
+        if vis is not None:
+            vis = vis.permute(0, 2, 1).contiguous()
+        kpts = self._format_keypoints(coords, vis).permute(0, 2, 1).contiguous()
+        return torch.cat((dbox, x["scores"].sigmoid(), kpts), 1)
+
+    def postprocess(self, preds: torch.Tensor) -> torch.Tensor:
+        """Select top anchors first, then decode RTMO keypoints only for the kept predictions."""
+        if self._rtmo_cached is None:
+            raise RuntimeError("PoseRTMO26.postprocess() requires cached RTMO tensors from _inference().")
+
+        boxes, scores = preds.split([4, self.nc], dim=-1)
+        score_values, conf, idx = self.get_topk_index(scores, self.max_det)
+        boxes = boxes.gather(dim=1, index=idx.repeat(1, 1, 4))
+
+        pose_vec = self._rtmo_cached["pose_vec"].permute(0, 2, 1).contiguous()
+        if pose_vec.shape[1] != self._rtmo_anchor_points.shape[0]:
+            raise RuntimeError(
+                f"PoseRTMO26 anchor count mismatch: pose_vec anchors={pose_vec.shape[1]} vs "
+                f"cached anchors={self._rtmo_anchor_points.shape[0]}."
+            )
+
+        pose_vec = pose_vec.gather(dim=1, index=idx.repeat(1, 1, self.pose_vec_channels))
+        anchor_points = self._gather_anchor_points(idx)
+        coords = self.dcc.forward_test(pose_vec, boxes, anchor_points)
+
+        vis = self._rtmo_cached.get("kpts_vis", None)
+        if vis is not None:
+            vis = vis.permute(0, 2, 1).contiguous().gather(dim=1, index=idx.repeat(1, 1, self.kpt_shape[0]))
+
+        kpts = self._format_keypoints(coords, vis)
+        return torch.cat([boxes, score_values, conf, kpts], dim=-1)
+
+    def fuse(self) -> None:
+        """Remove only the one-to-many RTMO heads for inference optimization."""
+        self.cv2 = self.cv3 = self.cv4 = self.cv4_proxy = self.cv4_pose_vec = self.cv4_vis = None
 
 
 class Classify(nn.Module):

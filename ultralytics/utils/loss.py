@@ -950,6 +950,125 @@ class PoseLoss26(v8PoseLoss):
         return kpts_loss, kpts_obj_loss, rle_loss
 
 
+class PoseRTMOLoss26(v8PoseLoss):
+    """Criterion class for RTMO-style YOLO26 pose estimation."""
+
+    def __init__(self, model, tal_topk: int = 10, tal_topk2: int | None = None):
+        """Initialize the RTMO pose loss with DCC and proxy supervision."""
+        super().__init__(model, tal_topk, tal_topk2 if tal_topk2 is not None else 10)
+        self.head = model.model[-1]
+        self.dcc = getattr(self.head, "dcc", None)
+        self.has_visible = self.kpt_shape[1] == 3
+        if self.dcc is None:
+            raise AttributeError("PoseRTMOLoss26 requires the model head to expose a `dcc` module.")
+
+    def loss(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Calculate the RTMO pose losses while reusing YOLO26 detection assignment."""
+        loss = torch.zeros(6, device=self.device)  # box, mle_pose, kobj, cls, dfl, proxy_pose
+        pred_proxy = preds["kpts_proxy"].permute(0, 2, 1).contiguous()
+        pred_pose_vec = preds["pose_vec"].permute(0, 2, 1).contiguous()
+        pred_vis = preds.get("kpts_vis", None)
+        if pred_vis is not None:
+            pred_vis = pred_vis.permute(0, 2, 1).contiguous()
+
+        batch_size = pred_proxy.shape[0]
+        num_anchors = pred_proxy.shape[1]
+        pred_proxy = pred_proxy.view(batch_size, num_anchors, self.kpt_shape[0], 2)
+
+        (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor), det_loss, _ = (
+            self.get_assigned_targets_and_loss(preds, batch)
+        )
+        loss[0], loss[3], loss[4] = det_loss[0], det_loss[1], det_loss[2]
+
+        pred_distri = preds["boxes"].permute(0, 2, 1).contiguous()
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)
+
+        imgsz = torch.tensor(preds["feats"][0].shape[2:], device=self.device, dtype=pred_proxy.dtype) * self.stride[0]
+        if fg_mask.sum():
+            keypoints = batch["keypoints"].to(self.device).float().clone()
+            keypoints[..., 0] *= imgsz[1]
+            keypoints[..., 1] *= imgsz[0]
+            selected_keypoints = self._select_target_keypoints(
+                keypoints,
+                batch["batch_idx"].view(-1, 1),
+                target_gt_idx,
+                fg_mask,
+            )
+            selected_keypoints[..., :2] /= stride_tensor.view(1, -1, 1, 1)
+            target_bboxes = target_bboxes / stride_tensor
+
+            expanded_anchor_points = anchor_points.view(1, -1, 2).expand(batch_size, -1, -1)
+            gt_kpt = selected_keypoints[fg_mask]
+            pred_proxy_fg = pred_proxy[fg_mask]
+            pred_pose_vec_fg = pred_pose_vec[fg_mask]
+            pred_boxes_fg = pred_bboxes[fg_mask].detach()
+            anchor_points_fg = expanded_anchor_points[fg_mask]
+            area = xyxy2xywh(target_bboxes[fg_mask])[:, 2:].prod(1, keepdim=True)
+            kpt_mask = gt_kpt[..., 2] != 0 if self.has_visible else torch.full_like(gt_kpt[..., 0], True)
+
+            pred_kpt_dec, dcc_aux = self.dcc.forward_train(pred_pose_vec_fg, pred_boxes_fg, anchor_points_fg)
+            loss[1] = self.calculate_mle_loss(dcc_aux, gt_kpt, kpt_mask, area)
+
+            pred_proxy_dec = self.head._proxy_decode(anchor_points_fg, pred_proxy_fg)
+            loss[5] = self.calculate_proxy_loss(pred_proxy_dec, pred_kpt_dec.detach(), kpt_mask, area)
+
+            if pred_vis is not None:
+                loss[2] = self.bce_pose(pred_vis[fg_mask], kpt_mask.float())
+        else:
+            loss[1] += pred_pose_vec.sum() * 0
+            loss[5] += pred_proxy.sum() * 0
+            if pred_vis is not None:
+                loss[2] += pred_vis.sum() * 0
+
+        loss[1] *= self.hyp.pose
+        loss[2] *= self.hyp.kobj
+        loss[5] *= self.hyp.proxy_pose
+        return loss * batch_size, loss.detach()
+
+    def calculate_mle_loss(
+        self,
+        dcc_aux: dict[str, torch.Tensor],
+        gt_kpt: torch.Tensor,
+        kpt_mask: torch.Tensor,
+        area: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute RTMO-style MLE loss from predicted 1-D heatmaps."""
+        if not kpt_mask.any():
+            return torch.tensor(0.0, device=gt_kpt.device)
+
+        sigma = dcc_aux["sigma"].clamp(min=1e-3).unsqueeze(-1)
+        scale = area.sqrt().clamp(min=1.0).unsqueeze(-1)
+        x_bins = dcc_aux["x_bins"].unsqueeze(-2)
+        y_bins = dcc_aux["y_bins"].unsqueeze(-2)
+        target_x = gt_kpt[..., 0:1]
+        target_y = gt_kpt[..., 1:2]
+
+        like_x = torch.exp(-(x_bins - target_x).abs() / (2 * sigma * scale)) / sigma
+        like_y = torch.exp(-(y_bins - target_y).abs() / (2 * sigma * scale)) / sigma
+        mix_x = (dcc_aux["x_prob"] * like_x).sum(dim=-1).clamp(min=1e-9)
+        mix_y = (dcc_aux["y_prob"] * like_y).sum(dim=-1).clamp(min=1e-9)
+        loss = -(mix_x.log() + mix_y.log())
+        return (loss * kpt_mask).sum() / kpt_mask.sum().clamp(min=1)
+
+    def calculate_proxy_loss(
+        self,
+        pred_proxy: torch.Tensor,
+        pred_kpt_dec: torch.Tensor,
+        kpt_mask: torch.Tensor,
+        area: torch.Tensor,
+    ) -> torch.Tensor:
+        """Use OKS-style supervision between proxy regression and detached DCC decoding."""
+        if not kpt_mask.any():
+            return torch.tensor(0.0, device=pred_proxy.device)
+
+        dist = (pred_proxy[..., 0] - pred_kpt_dec[..., 0]).pow(2) + (pred_proxy[..., 1] - pred_kpt_dec[..., 1]).pow(2)
+        sigmas = self.keypoint_loss.sigmas.to(dist.device).view(1, -1)
+        area = area.clamp(min=1e-9)
+        oks = torch.exp(-dist / ((2 * sigmas).pow(2) * area * 2))
+        oks = (oks * kpt_mask).sum(dim=1) / kpt_mask.sum(dim=1).clamp(min=1)
+        return (1.0 - oks).mean()
+
+
 class v8ClassificationLoss:
     """Criterion class for computing training losses for classification."""
 

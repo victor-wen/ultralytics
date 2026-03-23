@@ -57,6 +57,7 @@ from ultralytics.nn.modules import (
     LRPCHead,
     Pose,
     Pose26,
+    PoseRTMO26,
     RepC3,
     RepConv,
     RepNCSPELAN4,
@@ -78,6 +79,7 @@ from ultralytics.utils.checks import check_requirements, check_suffix, check_yam
 from ultralytics.utils.loss import (
     E2ELoss,
     PoseLoss26,
+    PoseRTMOLoss26,
     v8ClassificationLoss,
     v8DetectionLoss,
     v8OBBLoss,
@@ -616,6 +618,9 @@ class PoseModel(DetectionModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the PoseModel."""
+        head = self.model[-1]
+        if isinstance(head, PoseRTMO26):
+            return E2ELoss(self, PoseRTMOLoss26) if getattr(self, "end2end", False) else PoseRTMOLoss26(self)
         return E2ELoss(self, PoseLoss26) if getattr(self, "end2end", False) else v8PoseLoss(self)
 
 
@@ -1689,6 +1694,7 @@ def parse_model(d, ch, verbose=True):
                 YOLOESegment26,
                 Pose,
                 Pose26,
+                PoseRTMO26,
                 OBB,
                 OBB26,
             }
@@ -1696,7 +1702,19 @@ def parse_model(d, ch, verbose=True):
             args.extend([reg_max, end2end, [ch[x] for x in f]])
             if m is Segment or m is YOLOESegment or m is Segment26 or m is YOLOESegment26:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, YOLOEDetect, Segment, Segment26, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26}:
+            if m in {
+                Detect,
+                YOLOEDetect,
+                Segment,
+                Segment26,
+                YOLOESegment,
+                YOLOESegment26,
+                Pose,
+                Pose26,
+                PoseRTMO26,
+                OBB,
+                OBB26,
+            }:
                 m.legacy = legacy
         elif m is v10Detect:
             args.append([ch[x] for x in f])
@@ -1810,7 +1828,7 @@ def guess_model_task(model):
                 return "segment"
             elif isinstance(m, Classify):
                 return "classify"
-            elif isinstance(m, Pose):
+            elif isinstance(m, (Pose, PoseRTMO26)):
                 return "pose"
             elif isinstance(m, OBB):
                 return "obb"
