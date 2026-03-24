@@ -335,6 +335,8 @@ def calculate_pose_oks(
     pred_kpts: torch.Tensor, gt_kpts: torch.Tensor, area: torch.Tensor, sigmas: torch.Tensor, eps: float = 1e-9
 ) -> torch.Tensor:
     """Compute OKS between predicted and ground-truth keypoints."""
+    gt_kpts = gt_kpts.to(device=pred_kpts.device, dtype=pred_kpts.dtype)
+    area = area.to(device=pred_kpts.device, dtype=pred_kpts.dtype)
     gt_xy = gt_kpts[..., :2]
     kpt_mask = gt_kpts[..., 2] != 0 if gt_kpts.shape[-1] == 3 else torch.ones_like(gt_xy[..., 0], dtype=torch.bool)
     dist = (pred_kpts[..., 0] - gt_xy[..., 0]).pow(2) + (pred_kpts[..., 1] - gt_xy[..., 1]).pow(2)
