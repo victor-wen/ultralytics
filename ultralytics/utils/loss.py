@@ -1178,7 +1178,7 @@ class PoseRTMOLoss26(v8PoseLoss):
         batched_keypoints = self.batch_keypoints(keypoints, batch["batch_idx"].view(-1), batch_size)
 
         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)
-        pred_proxy_dec = self.head._proxy_decode(anchor_points.view(1, -1, 1, 2), pred_proxy)
+        pred_proxy_dec = self.head._proxy_decode(anchor_points, pred_proxy)
         pred_proxy_pixels = pred_proxy_dec * stride_tensor.view(1, -1, 1, 1)
         target_labels, target_bboxes, target_scores, fg_mask, target_gt_idx = self.pose_assigner(
             pred_scores.detach().sigmoid(),
