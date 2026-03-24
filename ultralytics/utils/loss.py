@@ -980,9 +980,6 @@ class PoseRTMOLoss26(v8PoseLoss):
         )
         loss[0], loss[3], loss[4] = det_loss[0], det_loss[1], det_loss[2]
 
-        pred_distri = preds["boxes"].permute(0, 2, 1).contiguous()
-        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)
-
         imgsz = torch.tensor(preds["feats"][0].shape[2:], device=self.device, dtype=pred_proxy.dtype) * self.stride[0]
         if fg_mask.sum():
             keypoints = batch["keypoints"].to(self.device).float().clone()
@@ -1001,16 +998,16 @@ class PoseRTMOLoss26(v8PoseLoss):
             gt_kpt = selected_keypoints[fg_mask]
             pred_proxy_fg = pred_proxy[fg_mask]
             pred_pose_vec_fg = pred_pose_vec[fg_mask]
-            pred_boxes_fg = pred_bboxes[fg_mask].detach()
+            target_boxes_fg = target_bboxes[fg_mask]
             anchor_points_fg = expanded_anchor_points[fg_mask]
             area = xyxy2xywh(target_bboxes[fg_mask])[:, 2:].prod(1, keepdim=True)
             kpt_mask = gt_kpt[..., 2] != 0 if self.has_visible else torch.full_like(gt_kpt[..., 0], True)
 
-            pred_kpt_dec, dcc_aux = self.dcc.forward_train(pred_pose_vec_fg, pred_boxes_fg, anchor_points_fg)
+            pred_kpt_dec, dcc_aux = self.dcc.forward_train(pred_pose_vec_fg, target_boxes_fg, anchor_points_fg)
             loss[1] = self.calculate_mle_loss(dcc_aux, gt_kpt, kpt_mask, area)
 
             pred_proxy_dec = self.head._proxy_decode(anchor_points_fg, pred_proxy_fg)
-            loss[5] = self.calculate_proxy_loss(pred_proxy_dec, pred_kpt_dec.detach(), kpt_mask, area)
+            loss[5] = self.calculate_proxy_loss(pred_proxy_dec, gt_kpt[..., :2], kpt_mask, area)
 
             if pred_vis is not None:
                 loss[2] = self.bce_pose(pred_vis[fg_mask], kpt_mask.float())
