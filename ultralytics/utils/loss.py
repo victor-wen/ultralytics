@@ -995,12 +995,12 @@ class PoseRTMOLoss26(v8PoseLoss):
             target_bboxes = target_bboxes / stride_tensor
 
             expanded_anchor_points = anchor_points.view(1, -1, 2).expand(batch_size, -1, -1)
-            gt_kpt = selected_keypoints[fg_mask]
+            gt_kpt = selected_keypoints[fg_mask].to(pred_pose_vec.dtype)
             pred_proxy_fg = pred_proxy[fg_mask]
             pred_pose_vec_fg = pred_pose_vec[fg_mask]
-            target_boxes_fg = target_bboxes[fg_mask]
+            target_boxes_fg = target_bboxes[fg_mask].to(pred_pose_vec_fg.dtype)
             anchor_points_fg = expanded_anchor_points[fg_mask]
-            area = xyxy2xywh(target_bboxes[fg_mask])[:, 2:].prod(1, keepdim=True)
+            area = xyxy2xywh(target_bboxes[fg_mask])[:, 2:].prod(1, keepdim=True).to(pred_pose_vec_fg.dtype)
             kpt_mask = gt_kpt[..., 2] != 0 if self.has_visible else torch.full_like(gt_kpt[..., 0], True)
 
             pred_kpt_dec, dcc_aux = self.dcc.forward_train(pred_pose_vec_fg, target_boxes_fg, anchor_points_fg)
