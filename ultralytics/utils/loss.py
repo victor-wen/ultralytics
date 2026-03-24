@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ultralytics.utils import LOGGER
 from ultralytics.utils.metrics import OKS_SIGMA, RLE_WEIGHT
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
@@ -328,6 +329,121 @@ class KeypointLoss(nn.Module):
         # e = d / (2 * (area * self.sigmas) ** 2 + 1e-9)  # from formula
         e = d / ((2 * self.sigmas).pow(2) * (area + 1e-9) * 2)  # from cocoeval
         return (kpt_loss_factor.view(-1, 1) * ((1 - torch.exp(-e)) * kpt_mask)).mean()
+
+
+def calculate_pose_oks(
+    pred_kpts: torch.Tensor, gt_kpts: torch.Tensor, area: torch.Tensor, sigmas: torch.Tensor, eps: float = 1e-9
+) -> torch.Tensor:
+    """Compute OKS between predicted and ground-truth keypoints."""
+    gt_xy = gt_kpts[..., :2]
+    kpt_mask = gt_kpts[..., 2] != 0 if gt_kpts.shape[-1] == 3 else torch.ones_like(gt_xy[..., 0], dtype=torch.bool)
+    dist = (pred_kpts[..., 0] - gt_xy[..., 0]).pow(2) + (pred_kpts[..., 1] - gt_xy[..., 1]).pow(2)
+    sigmas = sigmas.to(device=pred_kpts.device, dtype=pred_kpts.dtype).view(*((1,) * (dist.ndim - 1)), -1)
+    denom = ((2 * sigmas).pow(2) * area.unsqueeze(-1).clamp(min=eps) * 2).clamp(min=eps)
+    oks = torch.exp(-dist / denom)
+    oks = oks * kpt_mask.to(dtype=oks.dtype)
+    return oks.sum(dim=-1) / kpt_mask.sum(dim=-1).clamp(min=1)
+
+
+class PoseTaskAlignedAssigner(TaskAlignedAssigner):
+    """Task-aligned assigner augmented with proxy-pose quality for RTMO training."""
+
+    def __init__(
+        self,
+        topk: int = 13,
+        num_classes: int = 80,
+        alpha: float = 1.0,
+        beta: float = 6.0,
+        stride: list = [8, 16, 32],
+        eps: float = 1e-9,
+        topk2=None,
+        sigmas: torch.Tensor | None = None,
+        pose_weight: float = 1.0,
+    ):
+        """Initialize the pose-aware assigner."""
+        super().__init__(topk=topk, num_classes=num_classes, alpha=alpha, beta=beta, stride=stride, eps=eps, topk2=topk2)
+        self.sigmas = sigmas
+        self.pose_weight = pose_weight
+
+    @torch.no_grad()
+    def forward(self, pd_scores, pd_bboxes, pd_kpts, anc_points, gt_labels, gt_bboxes, gt_keypoints, mask_gt):
+        """Compute task-aligned assignments using proxy pose quality during matching."""
+        self.bs = pd_scores.shape[0]
+        self.n_max_boxes = gt_bboxes.shape[1]
+        device = gt_bboxes.device
+
+        if self.n_max_boxes == 0:
+            return (
+                torch.full_like(pd_scores[..., 0], self.num_classes),
+                torch.zeros_like(pd_bboxes),
+                torch.zeros_like(pd_scores),
+                torch.zeros_like(pd_scores[..., 0]),
+                torch.zeros_like(pd_scores[..., 0]),
+            )
+
+        try:
+            return self._forward(pd_scores, pd_bboxes, pd_kpts, anc_points, gt_labels, gt_bboxes, gt_keypoints, mask_gt)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                LOGGER.warning("CUDA OutOfMemoryError in PoseTaskAlignedAssigner, using CPU")
+                cpu_tensors = [t.cpu() for t in (pd_scores, pd_bboxes, pd_kpts, anc_points, gt_labels, gt_bboxes, gt_keypoints, mask_gt)]
+                result = self._forward(*cpu_tensors)
+                return tuple(t.to(device) for t in result)
+            raise
+
+    def _forward(self, pd_scores, pd_bboxes, pd_kpts, anc_points, gt_labels, gt_bboxes, gt_keypoints, mask_gt):
+        """Compute pose-aware assignments on the current device."""
+        mask_pos, align_metric, overlaps = self.get_pos_mask(
+            pd_scores, pd_bboxes, pd_kpts, gt_labels, gt_bboxes, gt_keypoints, anc_points, mask_gt
+        )
+
+        target_gt_idx, fg_mask, mask_pos = self.select_highest_overlaps(mask_pos, overlaps, self.n_max_boxes, align_metric)
+        target_labels, target_bboxes, target_scores = self.get_targets(gt_labels, gt_bboxes, target_gt_idx, fg_mask)
+
+        align_metric *= mask_pos
+        pos_align_metrics = align_metric.amax(dim=-1, keepdim=True)
+        pos_overlaps = (overlaps * mask_pos).amax(dim=-1, keepdim=True)
+        norm_align_metric = (align_metric * pos_overlaps / (pos_align_metrics + self.eps)).amax(-2).unsqueeze(-1)
+        target_scores = target_scores * norm_align_metric
+        return target_labels, target_bboxes, target_scores, fg_mask.bool(), target_gt_idx
+
+    def get_pos_mask(self, pd_scores, pd_bboxes, pd_kpts, gt_labels, gt_bboxes, gt_keypoints, anc_points, mask_gt):
+        """Build the positive-mask candidates using proxy pose quality."""
+        mask_in_gts = self.select_candidates_in_gts(anc_points, gt_bboxes, mask_gt)
+        align_metric, overlaps = self.get_pose_box_metrics(
+            pd_scores, pd_bboxes, pd_kpts, gt_labels, gt_bboxes, gt_keypoints, mask_in_gts * mask_gt
+        )
+        mask_topk = self.select_topk_candidates(align_metric, topk_mask=mask_gt.expand(-1, -1, self.topk).bool())
+        mask_pos = mask_topk * mask_in_gts * mask_gt
+        return mask_pos, align_metric, overlaps
+
+    def get_pose_box_metrics(self, pd_scores, pd_bboxes, pd_kpts, gt_labels, gt_bboxes, gt_keypoints, mask_gt):
+        """Compute assignment metrics from cls scores, boxes, and proxy-pose OKS."""
+        na = pd_bboxes.shape[-2]
+        mask_gt = mask_gt.bool()
+        overlaps = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_bboxes.dtype, device=pd_bboxes.device)
+        bbox_scores = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_scores.dtype, device=pd_scores.device)
+        pose_scores = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_scores.dtype, device=pd_scores.device)
+
+        ind = torch.zeros([2, self.bs, self.n_max_boxes], dtype=torch.long, device=pd_scores.device)
+        ind[0] = torch.arange(end=self.bs, device=pd_scores.device).view(-1, 1).expand(-1, self.n_max_boxes)
+        ind[1] = gt_labels.squeeze(-1)
+        bbox_scores[mask_gt] = pd_scores[ind[0], :, ind[1]][mask_gt]
+
+        pd_boxes = pd_bboxes.unsqueeze(1).expand(-1, self.n_max_boxes, -1, -1)[mask_gt]
+        gt_boxes = gt_bboxes.unsqueeze(2).expand(-1, -1, na, -1)[mask_gt]
+        overlaps[mask_gt] = self.iou_calculation(gt_boxes, pd_boxes)
+
+        if self.sigmas is None:
+            raise AttributeError("PoseTaskAlignedAssigner requires keypoint sigmas.")
+
+        pd_pose = pd_kpts.unsqueeze(1).expand(-1, self.n_max_boxes, -1, -1, -1)[mask_gt]
+        gt_pose = gt_keypoints.unsqueeze(2).expand(-1, -1, na, -1, -1)[mask_gt]
+        area = xyxy2xywh(gt_boxes)[..., 2:].prod(dim=-1)
+        pose_scores[mask_gt] = calculate_pose_oks(pd_pose, gt_pose, area, self.sigmas, self.eps)
+
+        align_metric = bbox_scores.pow(self.alpha) * overlaps.pow(self.beta) * pose_scores.clamp(min=self.eps).pow(self.pose_weight)
+        return align_metric, overlaps
 
 
 class v8DetectionLoss:
@@ -959,14 +1075,25 @@ class PoseRTMOLoss26(v8PoseLoss):
         self.head = model.model[-1]
         self.dcc = getattr(self.head, "dcc", None)
         self.has_visible = self.kpt_shape[1] == 3
+        self.varifocal_loss = VarifocalLoss()
+        self.pose_assigner = PoseTaskAlignedAssigner(
+            topk=tal_topk,
+            num_classes=self.nc,
+            alpha=0.5,
+            beta=6.0,
+            stride=self.stride.tolist(),
+            topk2=tal_topk2,
+            sigmas=self.keypoint_loss.sigmas,
+        )
         if self.dcc is None:
             raise AttributeError("PoseRTMOLoss26 requires the model head to expose a `dcc` module.")
 
     def loss(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        """Calculate the RTMO pose losses while reusing YOLO26 detection assignment."""
+        """Calculate RTMO pose losses with proxy-aware assignment and OKS score targets."""
         loss = torch.zeros(6, device=self.device)  # box, mle_pose, kobj, cls, dfl, proxy_pose
         pred_proxy = preds["kpts_proxy"].permute(0, 2, 1).contiguous()
         pred_pose_vec = preds["pose_vec"].permute(0, 2, 1).contiguous()
+        pred_scores = preds["scores"].permute(0, 2, 1).contiguous()
         pred_vis = preds.get("kpts_vis", None)
         if pred_vis is not None:
             pred_vis = pred_vis.permute(0, 2, 1).contiguous()
@@ -974,53 +1101,140 @@ class PoseRTMOLoss26(v8PoseLoss):
         batch_size = pred_proxy.shape[0]
         num_anchors = pred_proxy.shape[1]
         pred_proxy = pred_proxy.view(batch_size, num_anchors, self.kpt_shape[0], 2)
+        assign = self.get_pose_assignment(preds, batch, pred_proxy)
+        fg_mask = assign["fg_mask"]
+        target_gt_idx = assign["target_gt_idx"]
+        target_bboxes = assign["target_bboxes_grid"]
+        anchor_points = assign["anchor_points"].view(1, -1, 2).expand(batch_size, -1, -1)
+        stride_tensor = assign["stride_tensor"]
+        target_labels = assign["target_labels"]
+        target_scores = torch.zeros_like(pred_scores)
+        label_targets = torch.zeros_like(pred_scores)
+        loss[0], loss[4] = assign["box_loss"], assign["dfl_loss"]
 
-        (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor), det_loss, _ = (
-            self.get_assigned_targets_and_loss(preds, batch)
-        )
-        loss[0], loss[3], loss[4] = det_loss[0], det_loss[1], det_loss[2]
-
-        imgsz = torch.tensor(preds["feats"][0].shape[2:], device=self.device, dtype=pred_proxy.dtype) * self.stride[0]
         if fg_mask.sum():
-            keypoints = batch["keypoints"].to(self.device).float().clone()
-            keypoints[..., 0] *= imgsz[1]
-            keypoints[..., 1] *= imgsz[0]
-            selected_keypoints = self._select_target_keypoints(
-                keypoints,
-                batch["batch_idx"].view(-1, 1),
-                target_gt_idx,
-                fg_mask,
+            target_gt_idx_expanded = target_gt_idx.unsqueeze(-1).unsqueeze(-1)
+            selected_keypoints = assign["batched_keypoints"].gather(
+                1, target_gt_idx_expanded.expand(-1, -1, self.kpt_shape[0], self.kpt_shape[1])
             )
             selected_keypoints[..., :2] /= stride_tensor.view(1, -1, 1, 1)
-            target_bboxes = target_bboxes / stride_tensor
 
-            expanded_anchor_points = anchor_points.view(1, -1, 2).expand(batch_size, -1, -1)
             gt_kpt = selected_keypoints[fg_mask].to(pred_pose_vec.dtype)
-            pred_proxy_fg = pred_proxy[fg_mask]
+            pred_proxy_dec = self.head._proxy_decode(anchor_points, pred_proxy)
+            pred_proxy_fg = pred_proxy_dec[fg_mask]
             pred_pose_vec_fg = pred_pose_vec[fg_mask]
-            target_boxes_fg = target_bboxes[fg_mask].to(pred_pose_vec_fg.dtype)
-            anchor_points_fg = expanded_anchor_points[fg_mask]
+            pred_boxes_fg = assign["pred_bboxes"][fg_mask].to(pred_pose_vec_fg.dtype)
+            anchor_points_fg = anchor_points[fg_mask]
             area = xyxy2xywh(target_bboxes[fg_mask])[:, 2:].prod(1, keepdim=True).to(pred_pose_vec_fg.dtype)
             kpt_mask = gt_kpt[..., 2] != 0 if self.has_visible else torch.full_like(gt_kpt[..., 0], True)
 
-            pred_kpt_dec, dcc_aux = self.dcc.forward_train(pred_pose_vec_fg, target_boxes_fg, anchor_points_fg)
+            pred_kpt_dec, dcc_aux = self.dcc.forward_train(pred_pose_vec_fg, pred_boxes_fg, anchor_points_fg)
             loss[1] = self.calculate_mle_loss(dcc_aux, gt_kpt, kpt_mask, area)
-
-            pred_proxy_dec = self.head._proxy_decode(anchor_points_fg, pred_proxy_fg)
-            loss[5] = self.calculate_proxy_loss(pred_proxy_dec, gt_kpt[..., :2], kpt_mask, area)
+            loss[5] = self.calculate_proxy_loss(pred_proxy_fg, pred_kpt_dec.detach(), kpt_mask, area)
 
             if pred_vis is not None:
                 loss[2] = self.bce_pose(pred_vis[fg_mask], kpt_mask.float())
+
+            pose_scores = calculate_pose_oks(pred_kpt_dec.detach(), gt_kpt, area.view(-1), self.keypoint_loss.sigmas)
+            fg_labels = target_labels[fg_mask].long().clamp_(0, self.nc - 1)
+            label_targets.scatter_(2, target_labels.clamp(0, self.nc - 1).unsqueeze(-1), 1)
+            label_targets *= fg_mask.unsqueeze(-1)
+            target_scores_fg = torch.zeros((fg_labels.shape[0], self.nc), dtype=pred_scores.dtype, device=self.device)
+            target_scores_fg.scatter_(1, fg_labels.unsqueeze(-1), pose_scores.unsqueeze(-1).to(pred_scores.dtype))
+            target_scores[fg_mask] = target_scores_fg
         else:
             loss[1] += pred_pose_vec.sum() * 0
             loss[5] += pred_proxy.sum() * 0
             if pred_vis is not None:
                 loss[2] += pred_vis.sum() * 0
 
+        target_scores_sum = target_scores.sum().clamp(min=1.0)
+        loss[3] = self.varifocal_loss(pred_scores, target_scores, label_targets.to(pred_scores.dtype)) / target_scores_sum
         loss[1] *= self.hyp.pose
         loss[2] *= self.hyp.kobj
+        loss[3] *= self.hyp.cls
         loss[5] *= self.hyp.proxy_pose
         return loss * batch_size, loss.detach()
+
+    def get_pose_assignment(
+        self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor], pred_proxy: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """Assign targets for RTMO training using proxy pose quality."""
+        pred_distri = preds["boxes"].permute(0, 2, 1).contiguous()
+        pred_scores = preds["scores"].permute(0, 2, 1).contiguous()
+        anchor_points, stride_tensor = make_anchors(preds["feats"], self.stride, 0.5)
+        batch_size = pred_scores.shape[0]
+        dtype = pred_scores.dtype
+        imgsz = torch.tensor(preds["feats"][0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
+
+        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+        targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+        gt_labels, gt_bboxes = targets.split((1, 4), 2)
+        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
+
+        keypoints = batch["keypoints"].to(self.device).float().clone()
+        keypoints[..., 0] *= imgsz[1]
+        keypoints[..., 1] *= imgsz[0]
+        batched_keypoints = self.batch_keypoints(keypoints, batch["batch_idx"].view(-1), batch_size)
+
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)
+        pred_proxy_dec = self.head._proxy_decode(anchor_points.view(1, -1, 1, 2), pred_proxy)
+        pred_proxy_pixels = pred_proxy_dec * stride_tensor.view(1, -1, 1, 1)
+        target_labels, target_bboxes, target_scores, fg_mask, target_gt_idx = self.pose_assigner(
+            pred_scores.detach().sigmoid(),
+            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+            pred_proxy_pixels.detach().type(gt_bboxes.dtype),
+            anchor_points * stride_tensor,
+            gt_labels,
+            gt_bboxes,
+            batched_keypoints,
+            mask_gt,
+        )
+        target_scores_sum = target_scores.sum().clamp(min=1.0)
+        box_loss = torch.zeros(1, device=self.device)
+        dfl_loss = torch.zeros(1, device=self.device)
+        if fg_mask.sum():
+            box_loss, dfl_loss = self.bbox_loss(
+                pred_distri,
+                pred_bboxes,
+                anchor_points,
+                target_bboxes / stride_tensor,
+                target_scores,
+                target_scores_sum,
+                fg_mask,
+                imgsz,
+                stride_tensor,
+            )
+        box_loss *= self.hyp.box
+        dfl_loss *= self.hyp.dfl
+        return {
+            "anchor_points": anchor_points,
+            "stride_tensor": stride_tensor,
+            "pred_bboxes": pred_bboxes,
+            "target_labels": target_labels,
+            "target_bboxes_grid": target_bboxes / stride_tensor,
+            "target_gt_idx": target_gt_idx,
+            "target_scores": target_scores,
+            "fg_mask": fg_mask,
+            "batched_keypoints": batched_keypoints,
+            "box_loss": box_loss.squeeze(0),
+            "dfl_loss": dfl_loss.squeeze(0),
+        }
+
+    @staticmethod
+    def batch_keypoints(keypoints: torch.Tensor, batch_idx: torch.Tensor, batch_size: int) -> torch.Tensor:
+        """Batch per-instance keypoints by image index."""
+        if keypoints.numel() == 0:
+            return keypoints.new_zeros((batch_size, 0, 0, 0))
+        batch_idx = batch_idx.flatten()
+        counts = torch.bincount(batch_idx, minlength=batch_size)
+        max_kpts = int(counts.max().item()) if counts.numel() else 0
+        batched_keypoints = keypoints.new_zeros((batch_size, max_kpts, keypoints.shape[1], keypoints.shape[2]))
+        for i in range(batch_size):
+            keypoints_i = keypoints[batch_idx == i]
+            if keypoints_i.numel():
+                batched_keypoints[i, : keypoints_i.shape[0]] = keypoints_i
+        return batched_keypoints
 
     def calculate_mle_loss(
         self,

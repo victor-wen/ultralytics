@@ -306,8 +306,11 @@ class BaseTrainer:
             if isinstance(self.args.freeze, int)
             else []
         )
+        freeze_name_overrides = getattr(self.args, "freeze_names", None) or []
+        if isinstance(freeze_name_overrides, str):
+            freeze_name_overrides = [x.strip() for x in freeze_name_overrides.split(",") if x.strip()]
         always_freeze_names = [".dfl"]  # always freeze these layers
-        freeze_layer_names = [f"model.{x}." for x in freeze_list] + always_freeze_names
+        freeze_layer_names = [f"model.{x}." for x in freeze_list] + freeze_name_overrides + always_freeze_names
         self.freeze_layer_names = freeze_layer_names
         for k, v in self.model.named_parameters():
             # v.register_hook(lambda x: torch.nan_to_num(x))  # NaN to 0 (commented for erratic training results)

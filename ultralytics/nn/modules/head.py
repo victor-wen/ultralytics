@@ -828,6 +828,19 @@ class RTMOTokenMixer(nn.Module):
         return residual + self.proj(x)
 
 
+class RTMOScale(nn.Module):
+    """A lightweight learnable-free scaling layer used by RTMO sigma prediction."""
+
+    def __init__(self, scale: float):
+        """Store a fixed scalar multiplier."""
+        super().__init__()
+        self.scale = scale
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Scale the input tensor."""
+        return x * self.scale
+
+
 class RTMODCC(nn.Module):
     """Dynamic Coordinate Classifier used by the RTMO pose head."""
 
@@ -836,7 +849,7 @@ class RTMODCC(nn.Module):
         in_channels: int,
         num_keypoints: int,
         feat_channels: int = 128,
-        num_bins: tuple[int, int] = (64, 64),
+        num_bins: tuple[int, int] = (192, 256),
         spe_channels: int = 128,
         bbox_expand_ratio: float = 1.25,
     ):
@@ -848,11 +861,14 @@ class RTMODCC(nn.Module):
         self.num_bins = tuple(num_bins)
         self.bbox_expand_ratio = bbox_expand_ratio
         self.spe = RTMOSinePositionEncoding(spe_channels)
-        self.pose_to_kpts = nn.Linear(in_channels, feat_channels * num_keypoints)
+        self.pose_to_kpts = nn.Sequential(
+            nn.Linear(in_channels, feat_channels * num_keypoints),
+            nn.BatchNorm1d(feat_channels * num_keypoints),
+        )
         self.token_mixer = RTMOTokenMixer(feat_channels)
         self.x_fc = nn.Linear(spe_channels, feat_channels)
         self.y_fc = nn.Linear(spe_channels, feat_channels)
-        self.sigma_fc = nn.Sequential(nn.Linear(in_channels, num_keypoints), nn.Sigmoid())
+        self.sigma_fc = nn.Sequential(nn.Linear(in_channels, num_keypoints), nn.Sigmoid(), RTMOScale(0.1))
         self.register_buffer("x_bins", torch.linspace(-0.5, 0.5, self.num_bins[0]), persistent=False)
         self.register_buffer("y_bins", torch.linspace(-0.5, 0.5, self.num_bins[1]), persistent=False)
 
@@ -940,7 +956,7 @@ class PoseRTMO26(Detect):
         self,
         nc: int = 80,
         kpt_shape: tuple = (17, 3),
-        num_bins: tuple[int, int] = (64, 64),
+        num_bins: tuple[int, int] = (192, 256),
         bbox_expand_ratio: float = 1.25,
         pose_vec_channels: int = 512,
         reg_max=16,
@@ -954,7 +970,7 @@ class PoseRTMO26(Detect):
         self.num_bins = tuple(num_bins)
         self.pose_vec_channels = pose_vec_channels
         self.has_visible = kpt_shape[1] == 3
-        pose_feat_channels = max(ch[0] // 2, 128)
+        pose_feat_channels = max(ch[0] // 4, kpt_shape[0] * (kpt_shape[1] + 2))
         self.pose_feat_channels = pose_feat_channels
         self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, pose_feat_channels, 3), Conv(pose_feat_channels, pose_feat_channels, 3)) for x in ch)
         self.cv4_proxy = nn.ModuleList(nn.Conv2d(pose_feat_channels, kpt_shape[0] * 2, 1) for _ in ch)
