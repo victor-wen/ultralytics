@@ -48,6 +48,7 @@ dropout: 0.0 # (float) dropout for classification head (classify only)
 
 # Val/Test settings ----------------------------------------------------------------------------------------------------
 val: True # (bool) run validation/testing during training
+val_batch: # (int, optional) validation batch size override; defaults to training batch when unset
 split: val # (str) dataset split to evaluate: 'val', 'test' or 'train'
 save_json: False # (bool) save results to COCO JSON for external evaluation
 conf: # (float, optional) confidence threshold; defaults: predict=0.25, val=0.001

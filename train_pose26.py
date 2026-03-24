@@ -31,6 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=300, help="Number of epochs.")
     parser.add_argument("--imgsz", type=int, default=640, help="Training image size.")
     parser.add_argument("--batch", type=int, default=16, help="Batch size.")
+    parser.add_argument("--val-batch", type=int, default=None, help="Optional validation batch size override.")
     parser.add_argument("--device", default="", help="Training device, e.g. '0', '0,1', or 'cpu'.")
     parser.add_argument("--workers", type=int, default=8, help="Number of dataloader workers.")
     parser.add_argument("--project", default="runs/pose", help="Project directory for outputs.")
@@ -87,6 +88,8 @@ def main() -> None:
     print(f"[train_pose26] model={model_yaml} head={args.head} scale={args.scale}")
     if args.end2end is not None:
         print(f"[train_pose26] overriding end2end={args.end2end} via {model_source}")
+    if args.val_batch is not None:
+        print(f"[train_pose26] overriding val_batch={args.val_batch}")
     print(f"[train_pose26] data={args.data} project={args.project} name={run_name}")
 
     model = YOLO(model_source, task="pose")
@@ -99,6 +102,7 @@ def main() -> None:
         "epochs": args.epochs,
         "imgsz": args.imgsz,
         "batch": args.batch,
+        "val_batch": args.val_batch,
         "workers": args.workers,
         "project": args.project,
         "name": run_name,

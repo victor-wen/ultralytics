@@ -7,8 +7,9 @@ from pathlib import Path
 from typing import Any
 
 from ultralytics.models import yolo
+from ultralytics.nn.modules import PoseRTMO26
 from ultralytics.nn.tasks import PoseModel
-from ultralytics.utils import DEFAULT_CFG
+from ultralytics.utils import DEFAULT_CFG, LOGGER
 from ultralytics.utils.torch_utils import unwrap_model
 
 
@@ -92,11 +93,25 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
     def get_validator(self):
         """Return an instance of the PoseValidator class for validation."""
         self.loss_names = "box_loss", "pose_loss", "kobj_loss", "cls_loss", "dfl_loss"
-        if getattr(unwrap_model(self.model).model[-1], "flow_model", None) is not None:
+        head = unwrap_model(self.model).model[-1]
+        if getattr(head, "flow_model", None) is not None:
             self.loss_names += ("rle_loss",)
-        return yolo.pose.PoseValidator(
-            self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
-        )
+
+        validator_args = copy(self.args)
+        train_batch = self.batch_size
+        explicit_val_batch = getattr(self.args, "val_batch", None)
+        if explicit_val_batch is not None:
+            validator_args.batch = explicit_val_batch
+            LOGGER.info(
+                f"Using explicit validation batch={validator_args.batch} while training with batch={train_batch}."
+            )
+        elif isinstance(head, PoseRTMO26) and not getattr(head, "end2end", True):
+            validator_args.batch = 1
+            LOGGER.info(
+                f"Using validation batch=1 while training with batch={train_batch} to avoid RTMO non-end2end OOM."
+            )
+
+        return yolo.pose.PoseValidator(self.test_loader, save_dir=self.save_dir, args=validator_args, _callbacks=self.callbacks)
 
     def get_dataset(self) -> dict[str, Any]:
         """Retrieve the dataset and ensure it contains the required `kpt_shape` key.

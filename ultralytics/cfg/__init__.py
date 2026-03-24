@@ -194,6 +194,7 @@ CFG_INT_KEYS = frozenset(
         "epochs",
         "patience",
         "workers",
+        "val_batch",
         "seed",
         "close_mosaic",
         "mask_ratio",
