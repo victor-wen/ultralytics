@@ -9,7 +9,7 @@ from typing import Any
 from ultralytics.models import yolo
 from ultralytics.nn.modules import PoseRTMO26
 from ultralytics.nn.tasks import PoseModel
-from ultralytics.utils import DEFAULT_CFG, LOGGER
+from ultralytics.utils import DEFAULT_CFG, LOCAL_RANK, LOGGER
 from ultralytics.utils.torch_utils import unwrap_model
 
 
@@ -100,16 +100,26 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
         validator_args = copy(self.args)
         train_batch = self.batch_size
         explicit_val_batch = getattr(self.args, "val_batch", None)
+        desired_val_batch = None
         if explicit_val_batch is not None:
-            validator_args.batch = explicit_val_batch
-            LOGGER.info(
-                f"Using explicit validation batch={validator_args.batch} while training with batch={train_batch}."
-            )
+            desired_val_batch = explicit_val_batch
+            LOGGER.info(f"Using explicit validation batch={desired_val_batch} while training with batch={train_batch}.")
         elif isinstance(head, PoseRTMO26) and not getattr(head, "end2end", True):
-            validator_args.batch = 1
+            desired_val_batch = 1
             LOGGER.info(
-                f"Using validation batch=1 while training with batch={train_batch} to avoid RTMO non-end2end OOM."
+                f"Using validation batch={desired_val_batch} while training with batch={train_batch} "
+                "to avoid RTMO non-end2end OOM."
             )
+        if desired_val_batch is not None:
+            current_val_batch = getattr(self.test_loader, "batch_size", None)
+            if current_val_batch != desired_val_batch:
+                self.test_loader = self.get_dataloader(
+                    self.data.get("val") or self.data.get("test"),
+                    batch_size=desired_val_batch,
+                    rank=LOCAL_RANK,
+                    mode="val",
+                )
+            validator_args.batch = desired_val_batch
 
         return yolo.pose.PoseValidator(self.test_loader, save_dir=self.save_dir, args=validator_args, _callbacks=self.callbacks)
 
