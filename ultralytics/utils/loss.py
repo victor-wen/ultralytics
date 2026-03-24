@@ -442,7 +442,7 @@ class PoseTaskAlignedAssigner(TaskAlignedAssigner):
         pd_pose = pd_kpts.unsqueeze(1).expand(-1, self.n_max_boxes, -1, -1, -1)[mask_gt]
         gt_pose = gt_keypoints.unsqueeze(2).expand(-1, -1, na, -1, -1)[mask_gt]
         area = xyxy2xywh(gt_boxes)[..., 2:].prod(dim=-1)
-        pose_scores[mask_gt] = calculate_pose_oks(pd_pose, gt_pose, area, self.sigmas, self.eps)
+        pose_scores[mask_gt] = calculate_pose_oks(pd_pose, gt_pose, area, self.sigmas, self.eps).to(pose_scores.dtype)
 
         align_metric = bbox_scores.pow(self.alpha) * overlaps.pow(self.beta) * pose_scores.clamp(min=self.eps).pow(self.pose_weight)
         return align_metric, overlaps
