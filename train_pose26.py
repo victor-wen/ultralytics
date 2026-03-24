@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import tempfile
 from pathlib import Path
 
 
@@ -37,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_bool_arg(parser, "amp", default=True, help_text="Enable AMP training.")
     add_bool_arg(parser, "val", default=True, help_text="Run validation.")
     add_bool_arg(parser, "pretrained", default=True, help_text="Enable pretrained behavior.")
+    add_bool_arg(parser, "end2end", default=None, help_text="Override model end-to-end mode.")
     parser.add_argument("--close-mosaic", type=int, default=10, help="Epochs before disabling mosaic.")
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
     parser.add_argument("--save-period", type=int, default=-1, help="Checkpoint save period. -1 disables periodic saves.")
@@ -47,6 +50,22 @@ def resolve_model_yaml(scale: str, head: str) -> str:
     """Resolve the model YAML name from scale and head selection."""
     suffix = "-pose-legacy.yaml" if head == "legacy" else "-pose.yaml"
     return f"yolo26{scale}{suffix}"
+
+
+def resolve_model_source(model_yaml: str, end2end: bool | None) -> str:
+    """Return the model source path, optionally overriding end-to-end mode via a temp YAML."""
+    if end2end is None:
+        return model_yaml
+
+    from ultralytics.nn.tasks import yaml_model_load
+    from ultralytics.utils import YAML
+
+    cfg = yaml_model_load(model_yaml)
+    cfg["end2end"] = end2end
+    cfg.pop("yaml_file", None)
+    temp_path = Path(tempfile.gettempdir()) / f"{Path(model_yaml).stem}-end2end-{str(end2end).lower()}-{os.getpid()}.yaml"
+    YAML.save(temp_path, cfg)
+    return str(temp_path)
 
 
 def build_run_name(scale: str, head: str, explicit_name: str) -> str:
@@ -62,12 +81,15 @@ def main() -> None:
     from ultralytics import YOLO
 
     model_yaml = resolve_model_yaml(args.scale, args.head)
+    model_source = resolve_model_source(model_yaml, args.end2end)
     run_name = build_run_name(args.scale, args.head, args.name)
 
     print(f"[train_pose26] model={model_yaml} head={args.head} scale={args.scale}")
+    if args.end2end is not None:
+        print(f"[train_pose26] overriding end2end={args.end2end} via {model_source}")
     print(f"[train_pose26] data={args.data} project={args.project} name={run_name}")
 
-    model = YOLO(model_yaml, task="pose")
+    model = YOLO(model_source, task="pose")
     if args.weights:
         print(f"[train_pose26] loading weights from {args.weights}")
         model.load(args.weights)
