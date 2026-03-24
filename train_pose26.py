@@ -6,7 +6,17 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from ultralytics import YOLO
+
+def add_bool_arg(parser: argparse.ArgumentParser, name: str, default: bool, help_text: str) -> None:
+    """Add a boolean flag compatible with both old and new Python argparse versions."""
+    if hasattr(argparse, "BooleanOptionalAction"):
+        parser.add_argument(f"--{name}", action=argparse.BooleanOptionalAction, default=default, help=help_text)
+        return
+
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(f"--{name}", dest=name, action="store_true", help=help_text)
+    group.add_argument(f"--no-{name}", dest=name, action="store_false", help=f"Disable {help_text.lower()}")
+    parser.set_defaults(**{name: default})
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -15,7 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data", required=True, help="Dataset YAML path.")
     parser.add_argument("--head", choices=("rtmo", "legacy"), default="rtmo", help="Pose head variant to train.")
     parser.add_argument("--scale", choices=("n", "s", "m", "l", "x"), default="n", help="YOLO26 model scale.")
-    parser.add_argument("--weights", default="", help="Optional pretrained weights to load before training.")
+    parser.add_argument("--weights", "--weight", dest="weights", default="", help="Optional pretrained weights to load before training.")
     parser.add_argument("--epochs", type=int, default=300, help="Number of epochs.")
     parser.add_argument("--imgsz", type=int, default=640, help="Training image size.")
     parser.add_argument("--batch", type=int, default=16, help="Batch size.")
@@ -24,9 +34,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project", default="runs/pose", help="Project directory for outputs.")
     parser.add_argument("--name", default="", help="Optional run name. If empty, one is generated from head/scale.")
     parser.add_argument("--cache", action="store_true", help="Enable dataset caching.")
-    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True, help="Enable AMP training.")
-    parser.add_argument("--val", action=argparse.BooleanOptionalAction, default=True, help="Run validation.")
-    parser.add_argument("--pretrained", action=argparse.BooleanOptionalAction, default=True, help="Enable pretrained behavior.")
+    add_bool_arg(parser, "amp", default=True, help_text="Enable AMP training.")
+    add_bool_arg(parser, "val", default=True, help_text="Run validation.")
+    add_bool_arg(parser, "pretrained", default=True, help_text="Enable pretrained behavior.")
     parser.add_argument("--close-mosaic", type=int, default=10, help="Epochs before disabling mosaic.")
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
     parser.add_argument("--save-period", type=int, default=-1, help="Checkpoint save period. -1 disables periodic saves.")
@@ -49,6 +59,7 @@ def build_run_name(scale: str, head: str, explicit_name: str) -> str:
 def main() -> None:
     """Train a YOLO26 pose model."""
     args = build_parser().parse_args()
+    from ultralytics import YOLO
 
     model_yaml = resolve_model_yaml(args.scale, args.head)
     run_name = build_run_name(args.scale, args.head, args.name)
