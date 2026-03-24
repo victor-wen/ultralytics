@@ -1226,7 +1226,7 @@ class PoseRTMOLoss26(v8PoseLoss):
         """Batch per-instance keypoints by image index."""
         if keypoints.numel() == 0:
             return keypoints.new_zeros((batch_size, 0, 0, 0))
-        batch_idx = batch_idx.flatten()
+        batch_idx = batch_idx.flatten().to(device=keypoints.device, dtype=torch.long)
         counts = torch.bincount(batch_idx, minlength=batch_size)
         max_kpts = int(counts.max().item()) if counts.numel() else 0
         batched_keypoints = keypoints.new_zeros((batch_size, max_kpts, keypoints.shape[1], keypoints.shape[2]))
